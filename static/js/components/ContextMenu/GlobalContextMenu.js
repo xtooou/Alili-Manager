@@ -1,0 +1,519 @@
+import { BaseContextMenu } from './BaseContextMenu.js';
+import { showToast } from '../../utils/uiHelpers.js';
+import { translate } from '../../utils/i18nHelpers.js';
+import { state } from '../../state/index.js';
+import { getCompleteApiConfig, getCurrentModelType } from '../../api/apiConfig.js';
+import { performModelUpdateCheck } from '../../utils/updateCheckHelpers.js';
+import { rematchModalManager } from '../../managers/RematchModalManager.js';
+import { showRematchSummary } from '../RematchSummaryModal.js';
+
+export class GlobalContextMenu extends BaseContextMenu {
+    constructor() {
+        super('globalContextMenu');
+        this._cleanupInProgress = false;
+        this._updateCheckInProgress = false;
+        this._licenseRefreshInProgress = false;
+    }
+
+    showMenu(x, y, origin = null) {
+        const contextOrigin = origin || { type: 'global' };
+
+        // Conditional visibility for recipes page
+        const isRecipesPage = state.currentPageType === 'recipes';
+        const modelUpdateItem = this.menu.querySelector('[data-action="check-model-updates"]');
+        const licenseRefreshItem = this.menu.querySelector('[data-action="fetch-missing-licenses"]');
+        const downloadExamplesItem = this.menu.querySelector('[data-action="download-example-images"]');
+        const cleanupExamplesItem = this.menu.querySelector('[data-action="cleanup-example-images-folders"]');
+        const excludedModelsItem = this.menu.querySelector('[data-action="manage-excluded-models"]');
+        const rematchRecipesItem = this.menu.querySelector('[data-action="rematch-recipes"]');
+        const groupByModelItem = this.menu.querySelector('[data-action="toggle-group-by-model"]');
+        const groupByModelCheck = groupByModelItem?.querySelector('.check-indicator');
+
+        // Update check indicator for group-by-model
+        if (groupByModelCheck) {
+            const isEnabled = !!state.global.settings.group_by_model;
+            groupByModelCheck.style.display = isEnabled ? 'block' : 'none';
+        }
+
+        if (isRecipesPage) {
+            modelUpdateItem?.classList.add('hidden');
+            licenseRefreshItem?.classList.add('hidden');
+            downloadExamplesItem?.classList.add('hidden');
+            cleanupExamplesItem?.classList.add('hidden');
+            excludedModelsItem?.classList.add('hidden');
+            groupByModelItem?.classList.add('hidden');
+            rematchRecipesItem?.classList.remove('hidden');
+        } else {
+            modelUpdateItem?.classList.remove('hidden');
+            licenseRefreshItem?.classList.remove('hidden');
+            downloadExamplesItem?.classList.remove('hidden');
+            cleanupExamplesItem?.classList.remove('hidden');
+            excludedModelsItem?.classList.remove('hidden');
+            groupByModelItem?.classList.remove('hidden');
+            rematchRecipesItem?.classList.add('hidden');
+        }
+
+        this._updateSeparatorVisibility();
+
+        super.showMenu(x, y, contextOrigin);
+    }
+
+    _updateSeparatorVisibility() {
+        const children = Array.from(this.menu.children);
+        const isVisible = (el) => el.classList.contains('context-menu-item') && !el.classList.contains('hidden');
+
+        children.forEach((el, index) => {
+            if (!el.classList.contains('context-menu-separator')) {
+                return;
+            }
+            const hasVisibleBefore = children.slice(0, index).some(isVisible);
+            const hasVisibleAfter = children.slice(index + 1).some(isVisible);
+            el.classList.toggle('hidden', !(hasVisibleBefore && hasVisibleAfter));
+        });
+    }
+
+    handleMenuAction(action, menuItem) {
+        switch (action) {
+            case 'cleanup-example-images-folders':
+                this.cleanupExampleImagesFolders(menuItem).catch((error) => {
+                    console.error('Failed to trigger example images cleanup:', error);
+                });
+                break;
+            case 'download-example-images':
+                this.downloadExampleImages(menuItem).catch((error) => {
+                    console.error('Failed to trigger example images download:', error);
+                });
+                break;
+            case 'check-model-updates':
+                this.checkModelUpdates(menuItem).catch((error) => {
+                    console.error('Failed to check model updates:', error);
+                });
+                break;
+            case 'fetch-missing-licenses':
+                this.fetchMissingLicenses(menuItem).catch((error) => {
+                    console.error('Failed to refresh missing license metadata:', error);
+                });
+                break;
+            case 'rematch-recipes':
+                this.rematchRecipes(menuItem).catch((error) => {
+                    console.error('Failed to rematch recipes:', error);
+                });
+                break;
+            case 'manage-excluded-models':
+                this.manageExcludedModels();
+                break;
+            case 'toggle-group-by-model':
+                this.toggleGroupByModel();
+                break;
+            default:
+                console.warn(`Unhandled global context menu action: ${action}`);
+                break;
+        }
+    }
+
+    manageExcludedModels() {
+        window.pageControls?.enterExcludedView?.().catch((error) => {
+            console.error('Failed to open excluded models view:', error);
+        });
+    }
+
+    toggleGroupByModel() {
+        const sm = window.settingsManager;
+        if (!sm) {
+            console.error('settingsManager not available on window');
+            return;
+        }
+        const newValue = !state.global.settings.group_by_model;
+        state.global.settings.group_by_model = newValue;
+
+        // Save/restore sort preference when toggling group_by_model
+        if (window.pageControls?.onGroupByModelToggled) {
+            window.pageControls.onGroupByModelToggled(newValue);
+        }
+
+        sm.saveSetting('group_by_model', newValue).catch((error) => {
+            console.error('Failed to save group_by_model setting:', error);
+            // Revert state on failure
+            state.global.settings.group_by_model = !newValue;
+        });
+
+        sm.applyFrontendSettings();
+        sm.reloadContent();
+    }
+
+    async downloadExampleImages(menuItem) {
+        const downloadPath = state?.global?.settings?.example_images_path;
+        if (!downloadPath) {
+            showToast('globalContextMenu.downloadExampleImages.missingPath', {}, 'warning');
+            return;
+        }
+
+        menuItem?.classList.add('disabled');
+
+        try {
+            const optimize = state.global.settings.optimize_example_images;
+
+            const response = await fetch('/api/lm/download-example-images', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    force: true,
+                    optimize,
+                    model_types: ['lora', 'checkpoint', 'embedding']
+                })
+            });
+
+            const data = await response.json();
+
+            if (data.success) {
+                showToast('toast.exampleImages.downloadStarted', {}, 'success');
+
+                const exampleImagesManager = window.exampleImagesManager;
+                if (exampleImagesManager) {
+                    exampleImagesManager.isDownloading = true;
+                    exampleImagesManager.isPaused = false;
+                    exampleImagesManager.isStopping = false;
+                    exampleImagesManager.hasShownCompletionToast = false;
+                    exampleImagesManager.startTime = new Date();
+                    exampleImagesManager.updateUI(data.status);
+                    exampleImagesManager.showProgressPanel();
+                    exampleImagesManager.startProgressUpdates();
+                    exampleImagesManager.updateDownloadButtonText();
+
+                    const stopButton = document.getElementById('stopExampleDownloadBtn');
+                    if (stopButton) {
+                        stopButton.disabled = false;
+                    }
+                }
+            } else {
+                showToast('toast.exampleImages.downloadStartFailed', { error: data.error }, 'error');
+            }
+        } catch (error) {
+            console.error('Failed to trigger example images download:', error);
+            showToast('toast.exampleImages.downloadStartFailed', {}, 'error');
+        } finally {
+            menuItem?.classList.remove('disabled');
+        }
+    }
+
+    async cleanupExampleImagesFolders(menuItem) {
+        if (this._cleanupInProgress) {
+            return;
+        }
+
+        this._cleanupInProgress = true;
+        menuItem?.classList.add('disabled');
+
+        try {
+            const response = await fetch('/api/lm/cleanup-example-image-folders', {
+                method: 'POST',
+            });
+
+            let payload;
+            try {
+                payload = await response.json();
+            } catch (parseError) {
+                payload = { error: 'Unexpected response format.' };
+            }
+
+            if (response.ok && (payload.success || payload.partial_success)) {
+                const movedTotal = payload.moved_total || 0;
+
+                if (movedTotal > 0) {
+                    showToast('globalContextMenu.cleanupExampleImages.success', { count: movedTotal }, 'success');
+                } else {
+                    showToast('globalContextMenu.cleanupExampleImages.none', {}, 'info');
+                }
+
+                if (payload.partial_success) {
+                    showToast(
+                        'globalContextMenu.cleanupExampleImages.partial',
+                        { failures: payload.move_failures ?? 0 },
+                        'warning',
+                    );
+                }
+            } else {
+                const message = payload?.error || 'Unknown error';
+                showToast('globalContextMenu.cleanupExampleImages.error', { message }, 'error');
+            }
+        } catch (error) {
+            showToast('globalContextMenu.cleanupExampleImages.error', { message: error.message || 'Unknown error' }, 'error');
+        } finally {
+            this._cleanupInProgress = false;
+            menuItem?.classList.remove('disabled');
+        }
+    }
+
+    async checkModelUpdates(menuItem) {
+        if (this._updateCheckInProgress) {
+            return;
+        }
+
+        this._updateCheckInProgress = true;
+        menuItem?.classList.add('disabled');
+
+        try {
+            await performModelUpdateCheck({
+                onComplete: () => {
+                    menuItem?.classList.remove('disabled');
+                    this._updateCheckInProgress = false;
+                }
+            });
+        } catch (error) {
+            console.error('Failed to check model updates:', error);
+        } finally {
+            if (this._updateCheckInProgress) {
+                this._updateCheckInProgress = false;
+                menuItem?.classList.remove('disabled');
+            }
+        }
+    }
+
+    async fetchMissingLicenses(menuItem) {
+        if (this._licenseRefreshInProgress) {
+            return;
+        }
+
+        const modelType = getCurrentModelType();
+        const apiConfig = getCompleteApiConfig(modelType);
+        const displayName = apiConfig?.config?.displayName ?? 'Model';
+        const typePlural = this._buildTypePlural(displayName);
+        const loadingMessage = translate(
+            'globalContextMenu.fetchMissingLicenses.loading',
+            { type: displayName, typePlural },
+            `Refreshing license metadata for ${typePlural}...`
+        );
+
+        const endpoint = apiConfig?.endpoints?.fetchMissingLicenses;
+        if (!endpoint) {
+            console.warn('Fetch missing license endpoint not configured for model type:', modelType);
+            showToast(
+                'globalContextMenu.fetchMissingLicenses.error',
+                { message: 'Endpoint unavailable', type: displayName, typePlural },
+                'warning'
+            );
+            return;
+        }
+
+        this._licenseRefreshInProgress = true;
+        menuItem?.classList?.add('disabled');
+        state.loadingManager?.showSimpleLoading?.(loadingMessage);
+
+        try {
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+
+            let payload = {};
+            try {
+                payload = await response.json();
+            } catch {
+                payload = {};
+            }
+
+            if (!response.ok || payload.success !== true) {
+                const errorMessage = payload?.error || response.statusText || 'Unknown error';
+                throw new Error(errorMessage);
+            }
+
+            const updated = Array.isArray(payload.updated) ? payload.updated : [];
+            if (updated.length > 0) {
+                showToast(
+                    'globalContextMenu.fetchMissingLicenses.success',
+                    { count: updated.length, type: displayName, typePlural },
+                    'success'
+                );
+            } else {
+                showToast(
+                    'globalContextMenu.fetchMissingLicenses.none',
+                    { type: displayName, typePlural },
+                    'info'
+                );
+            }
+        } catch (error) {
+            console.error('Failed to refresh missing license metadata:', error);
+            showToast(
+                'globalContextMenu.fetchMissingLicenses.error',
+                { message: error?.message ?? 'Unknown error', type: displayName, typePlural },
+                'error'
+            );
+        } finally {
+            state.loadingManager?.hide?.();
+            if (typeof state.loadingManager?.restoreProgressBar === 'function') {
+                state.loadingManager.restoreProgressBar();
+            }
+
+            this._licenseRefreshInProgress = false;
+            menuItem?.classList?.remove('disabled');
+        }
+    }
+
+    _buildTypePlural(displayName) {
+        if (!displayName) {
+            return 'models';
+        }
+
+        const lower = displayName.toLowerCase();
+        if (lower.endsWith('s')) {
+            return displayName;
+        }
+
+        return `${displayName}s`;
+    }
+
+    async rematchRecipes(menuItem) {
+        if (this._rematchInProgress) {
+            return;
+        }
+
+        // Collect options (relaxed matching) before starting anything; the
+        // run only begins when the user confirms the dialog.
+        rematchModalManager.showOptionsModal({
+            onConfirm: ({ relaxed }) => this._startRematch(menuItem, relaxed),
+        });
+    }
+
+    async _startRematch(menuItem, relaxed = false) {
+        if (this._rematchInProgress) {
+            return;
+        }
+
+        this._rematchInProgress = true;
+        menuItem?.classList.add('disabled');
+
+        const loadingMessage = translate(
+            'globalContextMenu.rematchRecipes.loading',
+            {},
+            'Rematching recipes to local models...'
+        );
+
+        const progressUI = state.loadingManager?.showEnhancedProgress(loadingMessage);
+        progressUI?.showCancelButton(() => this.cancelRematch());
+
+        try {
+            const response = await fetch('/api/lm/recipes/rematch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ relaxed: !!relaxed }),
+            });
+
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.error || 'Failed to start rematch');
+            }
+
+            // Poll for progress (mirrors the repair flow; the backend reports `rematched` counts)
+            let isComplete = false;
+            while (!isComplete && this._rematchInProgress) {
+                const progressResponse = await fetch('/api/lm/recipes/rematch-progress');
+                if (progressResponse.ok) {
+                    const progressResult = await progressResponse.json();
+                    if (progressResult.success && progressResult.progress) {
+                        const p = progressResult.progress;
+                        if (p.status === 'processing') {
+                            const percent = (p.current / p.total) * 100;
+                            progressUI?.updateProgress(percent, p.recipe_name, `${loadingMessage} (${p.current}/${p.total})`);
+                        } else if (p.status === 'completed') {
+                            isComplete = true;
+                            // Newer backends report unified matched_entries /
+                            // matched_recipes; fall back to legacy `rematched`
+                            // (recipe count) for older ones.
+                            const entries = p.matched_entries ?? p.rematched ?? 0;
+                            const recipes = p.matched_recipes ?? p.rematched ?? 0;
+                            const failures = p.errors || 0;
+                            const unresolved = p.unresolved_entries ?? 0;
+                            const l4Matches = Array.isArray(p.l4_matches) ? p.l4_matches : [];
+                            // Complete no-op (nothing matched, nothing
+                            // unresolved, no errors) keeps the lightweight
+                            // toast; anything else opens the post-run summary
+                            // modal.
+                            const isNoop = entries === 0 && unresolved === 0 && failures === 0;
+                            if (isNoop) {
+                                progressUI?.complete(translate(
+                                    'globalContextMenu.rematchRecipes.success',
+                                    { count: recipes, recipes, entries, failures },
+                                    `Matched ${entries} entries across ${recipes} recipes.`
+                                ));
+                                showToast('globalContextMenu.rematchRecipes.success', { count: recipes, recipes, entries, failures }, 'success');
+                            } else {
+                                progressUI?.complete();
+                                showRematchSummary({
+                                    scope: 'global',
+                                    total: p.total || 0,
+                                    matchedRecipes: recipes,
+                                    matchedEntries: entries,
+                                    unresolvedRecipes: p.unresolved_recipes ?? 0,
+                                    unresolvedEntries: unresolved,
+                                    skipped: p.skipped || 0,
+                                    errors: failures,
+                                    l4Matches,
+                                });
+                            }
+                            // Refresh recipes page if active
+                            if (window.recipesPage) {
+                                window.recipesPage.refresh();
+                            }
+                        } else if (p.status === 'error') {
+                            throw new Error(p.error || 'Rematch failed');
+                        } else if (p.status === 'cancelled') {
+                            isComplete = true;
+                            const cancelledEntries = p.matched_entries ?? p.rematched ?? 0;
+                            const cancelledRecipes = p.matched_recipes ?? p.rematched ?? 0;
+                            progressUI?.complete(translate(
+                                'globalContextMenu.rematchRecipes.cancelled',
+                                { count: cancelledRecipes, recipes: cancelledRecipes, entries: cancelledEntries },
+                                `Rematch cancelled. ${cancelledRecipes} recipes updated (${cancelledEntries} entries).`
+                            ));
+                            // A cancelled run still reports partial results
+                            // via the summary modal (marked as cancelled).
+                            showRematchSummary({
+                                scope: 'global',
+                                cancelled: true,
+                                total: p.total || 0,
+                                matchedRecipes: cancelledRecipes,
+                                matchedEntries: cancelledEntries,
+                                unresolvedRecipes: p.unresolved_recipes ?? 0,
+                                unresolvedEntries: p.unresolved_entries ?? 0,
+                                skipped: p.skipped || 0,
+                                errors: p.errors || 0,
+                                l4Matches: Array.isArray(p.l4_matches) ? p.l4_matches : [],
+                            });
+                            if (window.recipesPage) {
+                                window.recipesPage.refresh();
+                            }
+                        }
+                    } else if (progressResponse.status === 404) {
+                        // Progress might have finished quickly and been cleaned up
+                        isComplete = true;
+                        progressUI?.complete();
+                    }
+                }
+
+                if (!isComplete) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        } catch (error) {
+            console.error('Recipe rematch failed:', error);
+            progressUI?.complete(translate('globalContextMenu.rematchRecipes.error', { message: error.message }, 'Rematch failed: {message}'));
+            showToast('globalContextMenu.rematchRecipes.error', { message: error.message }, 'error');
+        } finally {
+            this._rematchInProgress = false;
+            menuItem?.classList.remove('disabled');
+        }
+    }
+
+    async cancelRematch() {
+        try {
+            await fetch('/api/lm/recipes/cancel-rematch', {
+                method: 'POST',
+            });
+        } catch (error) {
+            console.error('Failed to cancel recipe rematch:', error);
+        }
+    }
+}

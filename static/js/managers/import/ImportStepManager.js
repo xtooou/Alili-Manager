@@ -1,0 +1,56 @@
+export class ImportStepManager {
+    constructor() {
+        this.injectedStyles = null;
+        this.currentStep = null;
+    }
+
+    removeInjectedStyles() {
+        if (this.injectedStyles && this.injectedStyles.parentNode) {
+            this.injectedStyles.parentNode.removeChild(this.injectedStyles);
+            this.injectedStyles = null;
+        }
+        
+        // Reset inline styles
+        document.querySelectorAll('.import-step').forEach(step => {
+            step.style.cssText = '';
+        });
+    }
+
+    showStep(stepId) {
+        // Remove any injected styles to prevent conflicts
+        this.removeInjectedStyles();
+        this.currentStep = stepId;
+        
+        // Hide all steps first
+        document.querySelectorAll('.import-step').forEach(step => {
+            step.style.display = 'none';
+        });
+        
+        // Show target step with a monitoring mechanism
+        const targetStep = document.getElementById(stepId);
+        if (targetStep) {
+            // Use direct style setting
+            targetStep.style.display = 'block';
+            
+            // For the locationStep specifically, we need additional measures
+            if (stepId === 'locationStep') {
+                // Create a more persistent style to override any potential conflicts
+                this.injectedStyles = document.createElement('style');
+                this.injectedStyles.innerHTML = `
+                    #locationStep {
+                        display: block !important;
+                        opacity: 1 !important;
+                        visibility: visible !important;
+                    }
+                `;
+                document.head.appendChild(this.injectedStyles);
+                
+                // Force layout recalculation
+                targetStep.offsetHeight;
+            }
+            
+            // Scroll the active step back to top (steps scroll independently of the modal shell)
+            targetStep.scrollTop = 0;
+        }
+    }
+}

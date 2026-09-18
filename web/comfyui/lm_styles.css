@@ -1,0 +1,1473 @@
+/* Shared styling for the LoRA Manager frontend widgets */
+.lm-tooltip {
+  position: fixed;
+  z-index: 10001;
+  background: rgba(0, 0, 0, 0.85);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  display: none;
+  overflow: hidden;
+  max-width: 300px;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.lm-tooltip__media-container {
+  position: relative;
+  max-width: 300px;
+  max-height: 300px;
+}
+
+.lm-tooltip__media {
+  max-width: 100%;
+  max-height: 300px;
+  object-fit: contain;
+  display: block;
+}
+
+.lm-tooltip__label {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 8px;
+  color: white;
+  font-size: 13px;
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.8));
+  text-align: center;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.lm-tooltip__license-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(10, 10, 14, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  max-width: calc(100% - 16px);
+}
+
+.lm-tooltip__license-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-block;
+  background-color: rgba(255, 255, 255, 0.9);
+  -webkit-mask: var(--license-icon-image) center/contain no-repeat;
+  mask: var(--license-icon-image) center/contain no-repeat;
+}
+
+/* Set 2 — new style license overlay */
+.lm-tooltip__license-overlay-new {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(10, 10, 14, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  max-width: calc(100% - 16px);
+}
+
+.lm-tooltip__license-icon-new {
+  width: 16px;
+  height: 16px;
+  display: inline-block;
+  border-radius: 3px;
+  -webkit-mask: var(--license-icon-image) center/contain no-repeat;
+  mask: var(--license-icon-image) center/contain no-repeat;
+}
+
+.lm-tooltip__license-icon-new.allowed {
+  background-color: #40c057;
+}
+
+.lm-tooltip__license-icon-new.denied {
+  background-color: #fa5252;
+}
+
+.lm-loras-container {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px;
+  background-color: rgba(40, 44, 52, 0.6);
+  border-radius: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+  outline: none;
+}
+
+/* Vue node mode: prevent content from pushing node size via ResizeObserver.
+   contain:size breaks the feedback loop — the container's intrinsic size
+   is determined solely by CSS, not by how many LoRAs are inside. */
+.lm-loras-container.lm-vue-node {
+  height: 100%;
+  min-height: var(--comfy-widget-min-height, 200px);
+  contain: layout size;
+}
+
+.lm-loras-container:focus {
+  outline: none;
+}
+
+/* Vue node mode: prevent content from pushing node size via ResizeObserver.
+   Same technique as .lm-loras-container.lm-vue-node above. */
+.comfy-tags-container.lm-vue-node {
+  height: 100%;
+  min-height: var(--comfy-widget-min-height, 150px);
+  contain: layout size;
+}
+
+.lm-lora-empty-state {
+  text-align: center;
+  padding: 20px 0;
+  color: rgba(226, 232, 240, 0.8);
+  font-style: italic;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  width: 100%;
+}
+
+.lm-loras-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.2);
+  margin-bottom: 5px;
+  position: relative;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.lm-toggle-container {
+  display: flex;
+  align-items: center;
+}
+
+.lm-toggle-label,
+.lm-strength-label {
+  color: rgba(226, 232, 240, 0.8);
+  font-size: 13px;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+.lm-toggle-label {
+  margin-left: 8px;
+}
+
+.lm-strength-label {
+  margin-right: 8px;
+  display: flex;
+  align-items: center;
+}
+
+.lm-drag-hint {
+  margin-left: 5px;
+  font-size: 11px;
+  opacity: 0.6;
+  transition: opacity 0.2s ease;
+}
+
+.lm-loras-header:hover .lm-drag-hint {
+  opacity: 1;
+}
+
+.lm-lora-entry {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  background-color: rgba(45, 55, 72, 0.7);
+  touch-action: none;
+  cursor: pointer !important;
+}
+
+.lm-lora-entry[data-active="false"] {
+  background-color: rgba(35, 40, 50, 0.5);
+}
+
+.lm-lora-entry:hover {
+  background-color: rgba(50, 60, 80, 0.8);
+}
+
+.lm-lora-entry[data-active="false"]:hover {
+  background-color: rgba(40, 45, 55, 0.6);
+}
+
+.lm-lora-entry[data-selected="true"][data-locked="true"] {
+  background-color: rgba(66, 153, 225, 0.2) !important;
+  border-left: 3px solid rgba(245, 158, 11, 0.8) !important;
+  border-right: 1px solid rgba(66, 153, 225, 0.6) !important;
+  border-top: 1px solid rgba(66, 153, 225, 0.6) !important;
+  border-bottom: 1px solid rgba(66, 153, 225, 0.6) !important;
+  box-shadow: 0 0 0 1px rgba(66, 153, 225, 0.3), inset 0 0 20px rgba(245, 158, 11, 0.04) !important;
+}
+
+.lm-lora-entry[data-selected="true"][data-locked="true"][data-active="false"] {
+  background-color: rgba(48, 42, 36, 0.5) !important;
+  border-left: 3px solid rgba(245, 158, 11, 0.6) !important;
+}
+
+.lm-lora-entry[data-missing="true"] {
+  background-color: rgba(220, 38, 38, 0.16);
+  border: 1px solid rgba(220, 38, 38, 0.5);
+}
+
+.lm-lora-entry[data-missing="true"] .lm-lora-name {
+  color: rgba(252, 165, 165, 0.95);
+}
+
+.lm-lora-clip-entry[data-missing="true"] {
+  background-color: rgba(220, 38, 38, 0.12);
+  border: 1px solid rgba(220, 38, 38, 0.4);
+  border-left: 2px solid rgba(220, 38, 38, 0.6);
+}
+
+.lm-lora-clip-entry[data-missing="true"] .lm-lora-name {
+  color: rgba(252, 165, 165, 0.95);
+}
+
+.lm-lora-name {
+  margin-left: 4px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 13px;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+.lm-lora-entry[data-active="false"] .lm-lora-name {
+  color: rgba(226, 232, 240, 0.6);
+}
+
+.lm-lora-strength-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lm-lora-strength-input {
+  width: 50px;
+  min-width: 50px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(226, 232, 240, 0.2);
+  background: rgba(26, 32, 44, 0.9);
+  color: rgba(226, 232, 240, 0.9);
+  text-align: center;
+  font-size: 13px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.lm-lora-strength-input:focus {
+  outline: none;
+  border-color: rgba(66, 153, 225, 0.9);
+  box-shadow: 0 0 0 2px rgba(66, 153, 225, 0.3);
+}
+
+.lm-lora-strength-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lm-lora-entry[data-active="false"] .lm-lora-strength-input {
+  color: rgba(226, 232, 240, 0.6);
+}
+
+.lm-lora-arrow {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  color: rgba(226, 232, 240, 0.8);
+  transition: all 0.2s ease;
+}
+
+.lm-lora-arrow:hover {
+  color: white;
+  transform: scale(1.2);
+}
+
+.lm-lora-arrow svg {
+  width: 12px;
+  height: 12px;
+}
+
+.lm-lora-expand-button {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  color: rgba(226, 232, 240, 0.7);
+  background-color: rgba(45, 55, 72, 0.3);
+  border: 1px solid rgba(226, 232, 240, 0.2);
+  border-radius: 3px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+.lm-lora-expand-button:hover {
+  background-color: rgba(66, 153, 225, 0.2);
+  border-color: rgba(66, 153, 225, 0.4);
+  color: rgba(226, 232, 240, 0.9);
+  transform: scale(1.05);
+}
+
+.lm-lora-expand-button:active {
+  transform: scale(0.95);
+  background-color: rgba(66, 153, 225, 0.3);
+}
+
+.lm-lora-expand-button:focus {
+  outline: none;
+}
+
+.lm-lora-expand-button:focus-visible {
+  box-shadow: 0 0 0 2px rgba(66, 153, 225, 0.5);
+}
+
+.lm-lora-toggle {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background-color: rgba(45, 55, 72, 0.7);
+  border: 1px solid rgba(226, 232, 240, 0.2);
+}
+
+.lm-lora-toggle--active {
+  background-color: rgba(66, 153, 225, 0.9);
+  border-color: rgba(66, 153, 225, 0.9);
+}
+
+.lm-lora-toggle:hover {
+  transform: scale(1.05);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.lm-lora-drag-handle {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+  color: rgba(226, 232, 240, 0.6);
+  transition: all 0.2s ease;
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.lm-lora-drag-handle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.lm-lora-drag-handle:hover {
+  color: rgba(226, 232, 240, 0.9);
+  transform: scale(1.1);
+}
+
+.lm-lora-drag-handle:active {
+  cursor: grabbing;
+}
+
+.lm-lora-lock-button {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  background-color: rgba(45, 55, 72, 0.3);
+  border: 1px solid rgba(226, 232, 240, 0.2);
+  border-radius: 3px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+  padding: 0;
+  box-sizing: border-box;
+  margin-right: 8px;
+  color: rgba(226, 232, 240, 0.8);
+}
+
+.lm-lora-lock-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.lm-lora-lock-button:hover {
+  background-color: rgba(66, 153, 225, 0.2);
+  border-color: rgba(66, 153, 225, 0.4);
+  color: rgba(226, 232, 240, 0.95);
+  transform: scale(1.05);
+}
+
+.lm-lora-lock-button:active {
+  transform: scale(0.95);
+}
+
+.lm-lora-lock-button:focus {
+  outline: none;
+}
+
+.lm-lora-lock-button:focus-visible {
+  box-shadow: 0 0 0 2px rgba(66, 153, 225, 0.5);
+}
+
+.lm-lora-lock-button--locked {
+  background-color: rgba(245, 158, 11, 0.25);
+  border-color: rgba(245, 158, 11, 0.7);
+  color: rgba(251, 191, 36, 0.95);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.15);
+}
+
+.lm-lora-lock-button--locked:hover {
+  background-color: rgba(245, 158, 11, 0.35);
+  border-color: rgba(245, 158, 11, 0.85);
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.25);
+}
+
+/* Visual styling for locked lora entries */
+.lm-lora-entry[data-locked="true"] {
+  background-color: rgba(60, 50, 40, 0.75);
+  border-left: 3px solid rgba(245, 158, 11, 0.7);
+  box-shadow: inset 0 0 20px rgba(245, 158, 11, 0.04);
+}
+
+.lm-lora-entry[data-locked="true"]:hover {
+  background-color: rgba(65, 55, 45, 0.85);
+  box-shadow: inset 0 0 24px rgba(245, 158, 11, 0.06);
+}
+
+.lm-lora-entry[data-locked="true"][data-active="false"] {
+  background-color: rgba(48, 42, 36, 0.6);
+  border-left: 3px solid rgba(245, 158, 11, 0.5);
+}
+
+.lm-lora-entry[data-locked="true"][data-active="false"]:hover {
+  background-color: rgba(52, 46, 40, 0.7);
+}
+
+body.lm-lora-strength-dragging,
+body.lm-lora-strength-dragging * {
+  cursor: ew-resize !important;
+  user-select: none !important;
+}
+
+body.lm-lora-reordering,
+body.lm-lora-reordering * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+.lm-lora-entry--dragging {
+  opacity: 0.5;
+  transform: scale(0.98);
+}
+
+.lm-lora-drop-indicator {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background-color: rgba(66, 153, 225, 0.9);
+  border-radius: 2px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  box-shadow: 0 0 6px rgba(66, 153, 225, 0.8);
+  z-index: 10;
+  pointer-events: none;
+}
+
+.lm-lora-strength-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.lm-lora-entry-left {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  gap: 6px;
+}
+
+.lm-lora-clip-entry {
+  margin-left: 10px;
+  margin-bottom: 4px;
+  padding: 6px;
+  padding-left: 20px;
+  border-radius: 6px;
+  background-color: rgba(65, 70, 90, 0.6);
+  border: 1px solid rgba(66, 153, 225, 0.2);
+  border-left: 2px solid rgba(72, 118, 255, 0.6);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: all 0.2s ease;
+  margin-top: -2px;
+  touch-action: none;
+  cursor: pointer !important;
+}
+
+.lm-lora-clip-entry[data-active="false"] {
+  background-color: rgba(50, 55, 65, 0.5);
+  border-color: rgba(66, 153, 225, 0.1);
+  border-left-color: rgba(66, 153, 225, 0.3);
+}
+
+.lm-lora-clip-entry:hover {
+  background-color: rgba(70, 75, 95, 0.7);
+}
+
+.lm-lora-clip-entry[data-active="false"]:hover {
+  background-color: rgba(55, 60, 70, 0.6);
+}
+
+.lm-lora-clip-entry .lm-lora-name {
+  font-size: 13px;
+  color: rgba(200, 215, 240, 0.9);
+  margin-left: 0;
+}
+
+.lm-lora-clip-entry[data-active="false"] .lm-lora-name {
+  color: rgba(200, 215, 240, 0.6);
+}
+
+.lm-lora-clip-entry .lm-lora-strength-input {
+  color: rgba(200, 215, 240, 0.9);
+}
+
+.lm-lora-clip-entry[data-active="false"] .lm-lora-strength-input {
+  color: rgba(200, 215, 240, 0.6);
+}
+
+.lm-lora-badge {
+  padding: 2px 6px;
+  border-radius: 12px;
+  background: rgba(66, 153, 225, 0.2);
+  color: rgba(226, 232, 240, 0.85);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.lm-lora-context-menu {
+  position: fixed;
+  background: rgba(26, 32, 44, 0.95);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+  padding: 8px 0;
+  z-index: 10000;
+  min-width: 180px;
+  border: 1px solid rgba(66, 153, 225, 0.3);
+  backdrop-filter: blur(6px);
+}
+
+.lm-lora-menu-item {
+  padding: 6px 20px;
+  cursor: pointer;
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 13px;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lm-lora-menu-item:hover {
+  background-color: rgba(66, 153, 225, 0.2);
+}
+
+.lm-lora-menu-item-icon {
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lm-lora-context-menu hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  margin: 6px 0;
+}
+
+.lm-trigger-count-badge {
+  font-variant-numeric: tabular-nums;
+}
+
+.lm-trigger-count-badge--edited {
+  color: rgba(226, 232, 240, 0.92);
+}
+
+.lm-trigger-group-edit-button {
+  transition: opacity 0.18s ease, color 0.18s ease;
+}
+
+.lm-trigger-group-edit-button:hover {
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.lm-trigger-group-editor {
+  background: rgba(26, 32, 44, 0.95);
+  border: 1px solid rgba(66, 153, 225, 0.24);
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+}
+
+.lm-trigger-group-editor__title {
+  color: rgba(226, 232, 240, 0.96);
+}
+
+.lm-trigger-group-editor__subtitle,
+.lm-trigger-group-editor__empty {
+  color: rgba(226, 232, 240, 0.72);
+}
+
+/* Autocomplete styling */
+.lm-autocomplete-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lm-autocomplete-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.lm-autocomplete-count {
+  font-size: 11px;
+  color: rgba(226, 232, 240, 0.5);
+}
+
+.lm-autocomplete-category {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+/* Category-specific badge colors */
+.lm-autocomplete-category--general {
+  background: rgba(0, 155, 230, 0.2);
+  color: #4bb4ff;
+}
+
+.lm-autocomplete-category--artist {
+  background: rgba(255, 138, 139, 0.2);
+  color: #ffc3c3;
+}
+
+.lm-autocomplete-category--copyright {
+  background: rgba(199, 151, 255, 0.2);
+  color: #ddc9fb;
+}
+
+.lm-autocomplete-category--character {
+  background: rgba(53, 198, 74, 0.2);
+  color: #93e49a;
+}
+
+.lm-autocomplete-category--meta {
+  background: rgba(234, 208, 132, 0.2);
+  color: #f7e7c3;
+}
+
+.lm-autocomplete-category--species {
+  background: rgba(237, 137, 54, 0.2);
+  color: #f6ad55;
+}
+
+.lm-autocomplete-category--lore {
+  background: rgba(72, 187, 120, 0.2);
+  color: #68d391;
+}
+
+/* Command list styling */
+.comfy-autocomplete-command {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.lm-autocomplete-command-name {
+  font-family: 'Consolas', 'Monaco', monospace;
+  color: rgba(66, 153, 225, 0.9);
+}
+
+.lm-autocomplete-command-label {
+  font-size: 12px;
+  color: rgba(226, 232, 240, 0.6);
+}
+
+/* ---- Widget flash highlight (visual cue after a value is sent to a node) ---- */
+/* Applied to a widget row element when its value is updated by LoRA Manager.
+   Shifts the value text color to the LM brand accent with a CSS transition
+   for fade-in/fade-out. Removal (timeout / hover) is handled by JS.
+
+   The transition is declared on .lm-flash-host (added alongside .lm-flash)
+   rather than on ComfyUI's .lg-node-widget, so we don't impose a global
+   color transition on every widget input. The host class persists until
+   cleanup so fade-out still applies after .lm-flash is removed. */
+.lm-flash-host input,
+.lm-flash-host textarea,
+.lm-flash-host [role="combobox"] {
+  transition: color 0.25s ease, -webkit-text-fill-color 0.25s ease;
+}
+
+.lm-flash input,
+.lm-flash textarea,
+.lm-flash [role="combobox"] {
+  color: #4299E0 !important;
+  -webkit-text-fill-color: #4299E0 !important;
+}
+
+/* 1. 外层容器变成自适应网格宫格 */
+.lm-loras-container {
+  display: grid !important;
+  width: 100% !important;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)) !important;
+  grid-auto-rows: max-content !important; /* 关键：按卡片内容计算行高，绝不重叠 */
+  align-content: start !important;        /* 关键：顶部对齐，防止 Toggle All 被垂直拉大 */
+  gap: 12px !important;
+  padding: 8px 12px 16px 12px !important;
+  box-sizing: border-box !important;
+  height: 100% !important;
+  overflow-y: auto !important;
+}
+
+/* 标题栏：永远紧凑单行，标准三段式布局 */
+.lm-loras-header {
+  grid-column: 1 / -1 !important;
+  height: 36px !important;
+  min-height: 36px !important;
+  max-height: 36px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  padding: 0 4px 6px 4px !important;
+  margin-bottom: 6px !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-sizing: border-box !important;
+  cursor: default !important;
+  gap: 12px !important;
+}
+
+/* 1. 左侧全选区 */
+.lm-toggle-container {
+  display: flex !important;
+  align-items: center !important;
+  flex-shrink: 0 !important;
+  gap: 6px !important;
+}
+.lm-toggle-label {
+  font-size: 12px !important;
+  color: rgba(255, 255, 255, 0.85) !important;
+  font-weight: 500 !important;
+  user-select: none !important;
+}
+
+/* 2. 中间过滤标签区：居中、自适应 */
+.lm-filter-tags-row {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  flex: 1 !important;
+  gap: 5px !important;
+  overflow-x: auto !important;
+  scrollbar-width: none !important; /* 隐藏滚动条 */
+}
+.lm-filter-tags-row::-webkit-scrollbar {
+  display: none;
+}
+
+.lm-filter-btn {
+  padding: 3px 9px !important;
+  font-size: 11px !important;
+  line-height: 14px !important;
+  border-radius: 6px !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  background: rgba(255, 255, 255, 0.05) !important;
+  color: rgba(255, 255, 255, 0.65) !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  white-space: nowrap !important;
+  transition: all 0.15s ease-in-out !important;
+}
+.lm-filter-btn:hover {
+  background: rgba(255, 255, 255, 0.12) !important;
+  color: #fff !important;
+}
+.lm-filter-btn.active {
+  background: #0084ff !important;
+  border-color: #0084ff !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+  box-shadow: 0 0 8px rgba(0, 132, 255, 0.4) !important;
+}
+
+/* 3. 右侧精致搜索胶囊 */
+.lm-search-wrapper {
+  position: relative !important;
+  display: flex !important;
+  align-items: center !important;
+  flex-shrink: 0 !important;
+}
+.lm-search-icon {
+  position: absolute !important;
+  left: 8px !important;
+  width: 12px !important;
+  height: 12px !important;
+  fill: rgba(255, 255, 255, 0.4) !important;
+  pointer-events: none !important;
+}
+.lm-search-input {
+  width: 130px !important;
+  height: 24px !important;
+  background: rgba(0, 0, 0, 0.35) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-radius: 12px !important;
+  padding: 0 10px 0 24px !important;
+  color: #fff !important;
+  font-size: 11px !important;
+  outline: none !important;
+  transition: all 0.2s ease !important;
+}
+.lm-search-input::placeholder {
+  color: rgba(255, 255, 255, 0.35) !important;
+}
+.lm-search-input:focus {
+  width: 160px !important;
+  background: rgba(0, 0, 0, 0.6) !important;
+  border-color: #0084ff !important;
+  box-shadow: 0 0 6px rgba(0, 132, 255, 0.35) !important;
+}
+
+/* 修复单个卡片：规范比例与层级 */
+.lm-lora-entry.lm-lora-card-mode {
+  position: relative !important;
+  width: 100% !important;
+  aspect-ratio: 3 / 4 !important;
+  height: auto !important;
+  min-height: 0 !important;              /* 清除之前的冲突高度，防止向下溢出重叠 */
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  background-color: #1a1a1a !important;
+  box-sizing: border-box !important;
+}
+
+.lm-lora-entry.lm-lora-card-mode:hover {
+  border-color: #666 !important;
+}
+
+/* 3. 缩略图铺满卡片主体 */
+.lm-card-thumb-wrapper {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
+.lm-card-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 4. 顶部浮动把手与开关 */
+.lm-card-top-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 6px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.7) 0%, transparent 100%);
+  z-index: 2;
+}
+
+/* 5. 底部半透明名字与调节器 */
+.lm-card-bottom-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 6px 6px 4px 6px;
+  background: linear-gradient(0deg, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.7) 60%, transparent 100%);
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 模型名称文字：允许两行折行，更贴近后台效果 */
+.lm-card-bottom-bar .lm-lora-name {
+  color: #ffffff !important;
+  font-size: 11px !important;
+  font-weight: 600 !important; /* 纯白高亮加粗，第一眼认清名字 */
+  line-height: 1.3;
+  display: -webkit-box !important;
+  -webkit-line-clamp: 2 !important;
+  -webkit-box-orient: vertical !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: normal !important;
+  text-align: left;
+  margin-bottom: 3px;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8) !important;
+}
+
+/* 截图同款：版本步数小标签（胶囊半透暗底） */
+.lm-card-version-badge {
+  display: none;
+  align-self: flex-start !important;
+  padding: 1px 6px !important;
+  background: rgba(0, 0, 0, 0.75) !important;
+  border-radius: 4px !important;
+  font-size: 9.5px !important;
+  font-weight: 600 !important;
+  line-height: 14px !important;
+  white-space: nowrap !important;
+  max-width: 90% !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  user-select: none !important;
+  margin-top: 1px !important;
+  margin-bottom: 2px !important;
+  backdrop-filter: blur(4px) !important;
+}
+
+/* LoRA 卡片：版本标签使用温润浅樱粉，呼应主题又区分白色名字 */
+.lm-lora-entry .lm-card-version-badge {
+  color: #FFD2DA !important;
+  border: 1px solid rgba(254, 129, 147, 0.35) !important;
+}
+
+/* 大模型卡片：版本标签使用冰晶浅青，与科技蓝呼应 */
+.lm-lora-entry.lm-ckpt-card .lm-card-version-badge {
+  color: #93E6FB !important;
+  border: 1px solid rgba(0, 210, 255, 0.35) !important;
+}
+
+/* 调节器适当缩小居中 */
+.lm-card-bottom-bar .lm-lora-strength-control {
+  transform: scale(0.88);
+  transform-origin: center;
+  margin: 0 auto;
+}
+
+/* 鼠标悬停卡片变成手型指针 */
+.lm-lora-entry.lm-lora-card-mode {
+  cursor: pointer !important;
+  transition: all 0.15s ease-in-out !important;
+}
+
+/* 激活状态：100% 同步大模型同款 #FE8193 粉色发光边框 */
+.lm-lora-entry.lm-lora-card-mode[data-active="true"] {
+  border: 2px solid #FE8193 !important;
+  box-shadow: 0 0 14px rgba(254, 129, 147, 0.5) !important;
+  opacity: 1 !important;
+  filter: none !important;
+}
+
+/* 未激活状态：100% 同步大模型同款微暗与 70% 灰度 */
+.lm-lora-entry.lm-lora-card-mode[data-active="false"] {
+  border: 1px solid #2d2d2d !important;
+  opacity: 0.55 !important;
+  filter: grayscale(70%) !important;
+}
+
+/* 补全：未激活 LoRA 鼠标滑过微亮粉色边框与粉色光晕 */
+.lm-lora-entry.lm-lora-card-mode[data-active="false"]:hover {
+  opacity: 0.85 !important;
+  filter: grayscale(20%) !important;
+  border-color: rgba(254, 129, 147, 0.6) !important;
+  box-shadow: 0 0 8px rgba(254, 129, 147, 0.3) !important;
+}
+
+/* 正在被拖动的卡片：半透明 */
+.lm-lora-entry.lm-dragging {
+  opacity: 0.3 !important;
+  transform: scale(0.95);
+}
+
+/* 禁止封面图自带的默认拖拽，鼠标直接抓取整个卡片 */
+.lm-card-thumb-wrapper,
+.lm-card-thumb-img {
+  pointer-events: none !important;
+  user-select: none !important;
+  -webkit-user-drag: none !important;
+}
+
+/* 顶部栏：左右两端排列 */
+.lm-card-top-bar {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  display: flex !important;
+  justify-content: space-between !important;
+  align-items: center !important;
+  padding: 4px 6px !important;
+  z-index: 3 !important;
+  pointer-events: none !important;
+}
+
+/* 核心修复：开关强制靠右，绝不再跑到左上角！ */
+.lm-card-top-bar .lm-lora-toggle {
+  margin-left: auto !important;
+  pointer-events: auto !important;
+}
+
+/* 截图同款：左上角药丸标签 */
+.lm-card-base-badge {
+  display: none; /* 默认先隐藏，有数据时才显示 */
+  align-items: center !important;
+  gap: 3px !important;
+  padding: 1px 5px !important;
+  background: rgba(0, 0, 0, 0.75) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  border-radius: 4px !important;
+  font-size: 9px !important;
+  font-weight: 700 !important;
+  color: #fff !important;
+  line-height: 14px !important;
+  backdrop-filter: blur(4px) !important;
+  user-select: none !important;
+}
+
+.lm-card-base-badge .lm-sub {
+  color: #e0e0e0 !important;
+}
+
+.lm-card-base-badge .lm-sep {
+  color: rgba(255, 255, 255, 0.4) !important;
+}
+
+/* LoRA卡片底模文字：呼应整体的温润粉色 */
+.lm-card-base-badge .lm-base {
+  color: #FFA6B6 !important;
+}
+
+/* 大模型卡片自动切换为专属科技青蓝 */
+.lm-loras-container[data-active-tab="ckpt"] .lm-card-base-badge .lm-base,
+.lm-ckpt-card .lm-card-base-badge .lm-base {
+  color: #00D2FF !important;
+}
+
+/* 截图同款：左下角版本步数小标签 */
+.lm-card-version-badge {
+  display: none; /* 默认隐藏 */
+  align-self: flex-start !important;
+  padding: 1px 5px !important;
+  background: rgba(0, 0, 0, 0.65) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  border-radius: 3px !important;
+  font-size: 9px !important;
+  color: #b8b8b8 !important;
+  line-height: 13px !important;
+  white-space: nowrap !important;
+  max-width: 90% !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  user-select: none !important;
+  margin-top: 1px !important;
+  margin-bottom: 2px !important;
+}
+
+/* 顶部标签组：左侧横向排列 */
+.lm-card-top-left {
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+/* 左上角：检测到新版本亮起的小蓝箭头 */
+.lm-card-update-badge {
+  display: none;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 15px !important;
+  height: 15px !important;
+  background: #00bcd4 !important;
+  color: #ffffff !important;
+  border-radius: 3px !important;
+  font-size: 11px !important;
+  font-weight: 900 !important;
+  line-height: 1 !important;
+  box-shadow: 0 0 6px rgba(0, 188, 212, 0.5) !important;
+  user-select: none !important;
+  cursor: pointer !important;
+  pointer-events: auto !important;
+  transition: transform 0.15s ease, filter 0.15s ease !important;
+}
+
+.lm-card-update-badge:hover {
+  filter: brightness(1.2) !important;
+  transform: scale(1.15) !important;
+}
+
+/* 右上角：精致半透明设置小齿轮（取代旧方块） */
+.lm-card-gear-btn {
+  margin-left: auto !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 18px !important;
+  height: 18px !important;
+  background: rgba(0, 0, 0, 0.6) !important;
+  color: rgba(255, 255, 255, 0.75) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  border-radius: 4px !important;
+  font-size: 11px !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  pointer-events: auto !important;
+  backdrop-filter: blur(4px) !important;
+  transition: all 0.15s ease-in-out !important;
+}
+
+/* LoRA卡片齿轮悬停：粉色边框 + 粉色半透发光 */
+.lm-card-gear-btn:hover {
+  color: #ffffff !important;
+  border-color: #FE8193 !important;
+  background: rgba(254, 129, 147, 0.45) !important;
+  box-shadow: 0 0 10px rgba(254, 129, 147, 0.45) !important;
+  transform: rotate(45deg) scale(1.1) !important;
+}
+
+/* 大模型卡片齿轮悬停：自动切换为青蓝发光 */
+.lm-loras-container[data-active-tab="ckpt"] .lm-card-gear-btn:hover,
+.lm-ckpt-card .lm-card-gear-btn:hover {
+  border-color: #00D2FF !important;
+  background: rgba(0, 210, 255, 0.4) !important;
+  box-shadow: 0 0 10px rgba(0, 210, 255, 0.4) !important;
+}
+
+/* 独立可移动、可拉伸、无遮罩的浮动工作台窗口 */
+#lm-floating-window {
+  position: fixed;
+  top: 90px;
+  left: 120px;
+  width: 1180px;
+  height: 820px;
+  min-width: 500px;
+  min-height: 380px;
+  resize: both; /* 允许右下角拖拽自由放大缩小 */
+  overflow: hidden;
+  background: #18181c;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.75);
+  z-index: 100000;
+  display: none;
+  flex-direction: column;
+}
+
+#lm-floating-header {
+  height: 32px;
+  min-height: 32px;
+  background: #252528;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  cursor: move; /* 抓手移动 */
+  user-select: none;
+}
+
+#lm-floating-title {
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+#lm-floating-close {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#lm-floating-close:hover {
+  background: #ff4d4f;
+}
+
+#lm-floating-body {
+  flex: 1;
+  width: 100%;
+  height: calc(100% - 32px);
+  position: relative;
+  overflow: hidden; /* 贴合对齐裁切 */
+}
+
+/* 72% 缩放并 100% 贴合填充容器 */
+#lm-floating-iframe {
+  width: 138.888889%;
+  height: 138.888889%;
+  transform: scale(0.72);
+  transform-origin: 0 0;
+  border: none;
+  display: block;
+  background: #222;
+}
+
+/* 浮窗顶栏的缩放滑块组件 */
+.lm-floating-zoom-wrap {
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  color: rgba(255, 255, 255, 0.75) !important;
+  font-size: 11px !important;
+  margin-left: 20px !important;
+  user-select: none !important;
+}
+
+.lm-floating-zoom-slider {
+  width: 90px !important;
+  height: 4px !important;
+  accent-color: #0084ff !important;
+  cursor: pointer !important;
+  outline: none !important;
+  vertical-align: middle !important;
+}
+
+#lm-floating-zoom-val {
+  min-width: 32px !important;
+  color: #00d2ff !important;
+  font-weight: 600 !important;
+}
+
+/* ==========================================================================
+   TAB 栏、大模型卡片与模式联动配色
+   ========================================================================== */
+/* 外层区：双行常驻控制台（top改为-66px顶到最顶层） */
+.lm-main-tabs-bar {
+  position: absolute !important;
+  top: -66px !important;
+  left: 0 !important;
+  right: 0 !important;
+  width: 100% !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  gap: 4px !important;
+  z-index: 100 !important;
+  user-select: none !important;
+  pointer-events: auto !important;
+  box-sizing: border-box !important;
+}
+
+/* 第1行：语法(左) | TAB胶囊(中) | 搜索框(右) */
+.lm-tabs-top-row {
+  position: relative !important;
+  width: 100% !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  gap: 12px !important; /* 组与组之间保留舒适的 12px 间距 */
+  height: 30px !important;
+  box-sizing: border-box !important;
+}
+
+/* 语法按钮靠在 TAB 胶囊左侧 */
+.lm-tabs-top-row .lm-syntax-toggle-btn {
+  position: relative !important;
+  left: auto !important;
+  top: auto !important;
+  transform: none !important;
+  order: -1 !important; /* 强制排在左侧第 1 位 */
+  margin-left: 74px !important; /* 核心：74px+56px=130px，与右边搜索框绝对配平，消灭偏心 */
+}
+
+/* 搜索框靠在 TAB 胶囊右侧 */
+.lm-tabs-top-row .lm-search-wrapper {
+  position: relative !important;
+  right: auto !important;
+  top: auto !important;
+  transform: none !important;
+  order: 1 !important; /* 强制排在右侧 */
+}
+
+/* 第2行：分类标签跟随上移，左右留80px避开端子，彻底不压宫格画布 */
+.lm-filter-tags-row {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 5px !important;
+  width: 100% !important;
+  padding: 0 80px !important;
+  box-sizing: border-box !important;
+  overflow-x: auto !important;
+  scrollbar-width: none !important;
+}
+.lm-filter-tags-row::-webkit-scrollbar {
+  display: none !important;
+}
+
+/* 点开语法文本框时：双行控制台退出绝对定位顺延排列 */
+.lm-loras-container[data-syntax-open="true"] .lm-main-tabs-bar {
+  grid-column: 1 / -1 !important;
+  position: relative !important;
+  top: 0 !important;
+  padding: 4px 0 8px 0 !important;
+}
+
+/* 基础胶囊按钮 */
+.lm-tab-pill {
+  display: inline-flex;
+  padding: 4px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 20px;
+  cursor: pointer;
+}
+
+/* LoRA 按钮内部右侧的选中数量提示徽章 */
+.lm-tab-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  margin-left: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  box-sizing: border-box;
+}
+
+/* 处于激活（粉色）状态下的数量胶囊底色 */
+.lm-tab-pill[data-tab="lora"].active .lm-tab-count-badge {
+  background: rgba(0, 0, 0, 0.35);
+  color: #ffffff;
+}
+
+/* 顶部 TAB 激活颜色（LoRA粉 / 大模型线条蓝） */
+.lm-tab-pill[data-tab="lora"].active {
+  background: #FE8193 !important;
+  border-color: #FE8193 !important;
+  box-shadow: 0 0 12px rgba(254, 129, 147, 0.5) !important;
+  color: #fff !important;
+}
+
+.lm-tab-pill[data-tab="ckpt"].active {
+  background: #00D2FF !important;
+  border-color: #00D2FF !important;
+  box-shadow: 0 0 12px rgba(0, 210, 255, 0.5) !important;
+  color: #fff !important;
+}
+
+/* 过滤标签激活色联动 */
+.lm-loras-container[data-active-tab="lora"] .lm-filter-btn.active {
+  background: #FE8193 !important;
+  border-color: #FE8193 !important;
+  box-shadow: 0 0 8px rgba(254, 129, 147, 0.45) !important;
+  color: #fff !important;
+}
+
+.lm-loras-container[data-active-tab="ckpt"] .lm-filter-btn.active {
+  background: #00D2FF !important;
+  border-color: #00D2FF !important;
+  box-shadow: 0 0 8px rgba(0, 210, 255, 0.45) !important;
+  color: #fff !important;
+}
+
+/* 大模型卡片：未选微暗，选中亮起图 2 线条蓝 */
+.lm-lora-entry.lm-ckpt-card[data-selected="false"] {
+  border: 1px solid #2d2d2d !important;
+  opacity: 0.55 !important;
+  filter: grayscale(70%) !important;
+}
+
+/* 照抄 LoRA 悬停效果：鼠标滑过发亮、恢复色彩并高亮边框 */
+.lm-lora-entry.lm-ckpt-card[data-selected="false"]:hover {
+  opacity: 0.85 !important;
+  filter: grayscale(20%) !important;
+  border-color: rgba(0, 210, 255, 0.5) !important;
+  box-shadow: 0 0 8px rgba(0, 210, 255, 0.25) !important;
+}
+
+.lm-lora-entry.lm-ckpt-card[data-selected="true"] {
+  border: 2px solid #00D2FF !important;
+  box-shadow: 0 0 14px rgba(0, 210, 255, 0.5) !important;
+  opacity: 1 !important;
+  filter: none !important;
+}

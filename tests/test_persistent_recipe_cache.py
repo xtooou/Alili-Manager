@@ -1,0 +1,726 @@
+"""Tests for PersistentRecipeCache."""
+
+import json
+import os
+import tempfile
+from typing import Any, Dict, List
+
+import pytest
+
+from py.services.persistent_recipe_cache import PersistentRecipeCache, PersistedRecipeData
+
+
+@pytest.fixture
+def temp_db_path():
+    """Create a temporary database path."""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    yield path
+    # Cleanup
+    if os.path.exists(path):
+        os.unlink(path)
+    # Also clean up WAL files
+    for suffix in ["-wal", "-shm"]:
+        wal_path = path + suffix
+        if os.path.exists(wal_path):
+            os.unlink(wal_path)
+
+
+@pytest.fixture
+def sample_recipes() -> List[Dict[str, Any]]:
+    """Create sample recipe data."""
+    return [
+        {
+            "id": "recipe-001",
+            "file_path": "/path/to/image1.png",
+            "title": "Test Recipe 1",
+            "folder": "folder1",
+            "base_model": "SD1.5",
+            "fingerprint": "abc123",
+            "created_date": 1700000000.0,
+            "modified": 1700000100.0,
+            "favorite": True,
+            "preview_nsfw_level": 1,
+            "loras": [
+                {"hash": "hash1", "file_name": "lora1", "strength": 0.8},
+                {"hash": "hash2", "file_name": "lora2", "strength": 1.0},
+            ],
+            "checkpoint": {"name": "model.safetensors", "hash": "cphash"},
+            "gen_params": {"prompt": "test prompt", "negative_prompt": "bad"},
+            "tags": ["tag1", "tag2"],
+        },
+        {
+            "id": "recipe-002",
+            "file_path": "/path/to/image2.png",
+            "title": "Test Recipe 2",
+            "folder": "",
+            "base_model": "SDXL",
+            "fingerprint": "def456",
+            "created_date": 1700000200.0,
+            "modified": 1700000300.0,
+            "favorite": False,
+            "preview_nsfw_level": 0,
+            "loras": [{"hash": "hash3", "file_name": "lora3", "strength": 0.5}],
+            "gen_params": {"prompt": "another prompt"},
+            "tags": [],
+        },
+    ]
+
+
+class TestPersistentRecipeCache:
+    """Tests for PersistentRecipeCache class."""
+
+    def test_init_creates_db(self, temp_db_path):
+        """Test that initialization creates the database."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        assert cache.is_enabled()
+        assert os.path.exists(temp_db_path)
+
+    def test_save_and_load_roundtrip(self, temp_db_path, sample_recipes):
+        """Test save and load cycle preserves data."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        # Save recipes
+        json_paths = {
+            "recipe-001": "/path/to/recipe-001.recipe.json",
+            "recipe-002": "/path/to/recipe-002.recipe.json",
+        }
+        cache.save_cache(sample_recipes, json_paths)
+
+        # Load recipes
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert len(loaded.raw_data) == 2
+
+        # Verify first recipe
+        r1 = next(r for r in loaded.raw_data if r["id"] == "recipe-001")
+        assert r1["title"] == "Test Recipe 1"
+        assert r1["folder"] == "folder1"
+        assert r1["base_model"] == "SD1.5"
+        assert r1["fingerprint"] == "abc123"
+        assert r1["favorite"] is True
+        assert len(r1["loras"]) == 2
+        assert r1["loras"][0]["hash"] == "hash1"
+        assert r1["checkpoint"]["name"] == "model.safetensors"
+        assert r1["gen_params"]["prompt"] == "test prompt"
+        assert r1["tags"] == ["tag1", "tag2"]
+
+        # Verify second recipe
+        r2 = next(r for r in loaded.raw_data if r["id"] == "recipe-002")
+        assert r2["title"] == "Test Recipe 2"
+        assert r2["folder"] == ""
+        assert r2["favorite"] is False
+
+    def test_empty_cache_returns_none(self, temp_db_path):
+        """Test that loading empty cache returns None."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        loaded = cache.load_cache()
+        assert loaded is None
+
+    def test_import_info_roundtrip(self, temp_db_path, sample_recipes):
+        """import_info (import provenance + no-LoRA reason) survives the cache."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        sample_recipes[0]["import_info"] = {
+            "channel": "batch_import_url",
+            "reason": "api_meta_no_lora_resources",
+            "details": {"api_meta_keys": ["prompt"], "api_model_version_ids": 0},
+        }
+        cache.save_cache(sample_recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        r1 = next(r for r in loaded.raw_data if r["id"] == "recipe-001")
+        assert r1["import_info"]["channel"] == "batch_import_url"
+        assert r1["import_info"]["reason"] == "api_meta_no_lora_resources"
+        assert r1["import_info"]["details"]["api_meta_keys"] == ["prompt"]
+
+        # Recipes without import_info simply omit the key.
+        r2 = next(r for r in loaded.raw_data if r["id"] == "recipe-002")
+        assert "import_info" not in r2
+
+    def test_import_info_column_migration(self, temp_db_path, sample_recipes):
+        """Existing databases gain the import_info_json column via ALTER TABLE."""
+        import sqlite3
+
+        # Simulate a legacy database without the new column.
+        conn = sqlite3.connect(temp_db_path)
+        conn.executescript(
+            """
+            CREATE TABLE recipes (
+                recipe_id TEXT PRIMARY KEY,
+                file_path TEXT,
+                json_path TEXT,
+                title TEXT,
+                folder TEXT,
+                source_path TEXT,
+                base_model TEXT,
+                fingerprint TEXT,
+                created_date REAL,
+                modified REAL,
+                file_mtime REAL,
+                file_size INTEGER,
+                favorite INTEGER DEFAULT 0,
+                preview_nsfw_level INTEGER DEFAULT 0,
+                loras_json TEXT,
+                checkpoint_json TEXT,
+                gen_params_json TEXT,
+                tags_json TEXT,
+                has_workflow INTEGER DEFAULT 0
+            );
+            CREATE TABLE cache_metadata (key TEXT PRIMARY KEY, value TEXT);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        conn = sqlite3.connect(temp_db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(recipes)")}
+        conn.close()
+        assert "import_info_json" in columns
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert len(loaded.raw_data) == 2
+
+    def test_update_single_recipe(self, temp_db_path, sample_recipes):
+        """Test updating a single recipe."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        # Update a recipe
+        updated_recipe = dict(sample_recipes[0])
+        updated_recipe["title"] = "Updated Title"
+        updated_recipe["favorite"] = False
+        cache.update_recipe(updated_recipe, "/path/to/recipe-001.recipe.json")
+
+        # Load and verify
+        loaded = cache.load_cache()
+        assert loaded is not None
+        r1 = next(r for r in loaded.raw_data if r["id"] == "recipe-001")
+        assert r1["title"] == "Updated Title"
+        assert r1["favorite"] is False
+
+    def test_remove_recipe(self, temp_db_path, sample_recipes):
+        """Test removing a recipe."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        # Remove a recipe
+        cache.remove_recipe("recipe-001")
+
+        # Load and verify
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert len(loaded.raw_data) == 1
+        assert loaded.raw_data[0]["id"] == "recipe-002"
+
+    def test_get_indexed_recipe_ids(self, temp_db_path, sample_recipes):
+        """Test getting all indexed recipe IDs."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        ids = cache.get_indexed_recipe_ids()
+        assert ids == {"recipe-001", "recipe-002"}
+
+    def test_get_recipe_count(self, temp_db_path, sample_recipes):
+        """Test getting recipe count."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        assert cache.get_recipe_count() == 0
+
+        cache.save_cache(sample_recipes)
+        assert cache.get_recipe_count() == 2
+
+        cache.remove_recipe("recipe-001")
+        assert cache.get_recipe_count() == 1
+
+    def test_file_stats(self, temp_db_path, sample_recipes):
+        """Test file stats tracking."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        json_paths = {
+            "recipe-001": "/path/to/recipe-001.recipe.json",
+            "recipe-002": "/path/to/recipe-002.recipe.json",
+        }
+        cache.save_cache(sample_recipes, json_paths)
+
+        stats = cache.get_file_stats()
+        # File stats will be (0.0, 0) since files don't exist
+        assert len(stats) == 2
+
+    def test_disabled_cache(self, temp_db_path, sample_recipes, monkeypatch):
+        """Test that disabled cache returns None."""
+        monkeypatch.setenv("LORA_MANAGER_DISABLE_PERSISTENT_CACHE", "1")
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        assert not cache.is_enabled()
+        cache.save_cache(sample_recipes)
+        assert cache.load_cache() is None
+
+    def test_invalid_recipe_skipped(self, temp_db_path):
+        """Test that recipes without ID are skipped."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        recipes = [
+            {"title": "No ID recipe"},  # Missing ID
+            {"id": "valid-001", "title": "Valid recipe"},
+        ]
+        cache.save_cache(recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert len(loaded.raw_data) == 1
+        assert loaded.raw_data[0]["id"] == "valid-001"
+
+    def test_get_default_singleton(self, monkeypatch):
+        """Test singleton behavior."""
+        # Use temp directory
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("LORA_MANAGER_RECIPE_CACHE_DB", os.path.join(tmpdir, "test.sqlite"))
+
+            PersistentRecipeCache.clear_instances()
+            cache1 = PersistentRecipeCache.get_default("test_lib")
+            cache2 = PersistentRecipeCache.get_default("test_lib")
+            assert cache1 is cache2
+
+            cache3 = PersistentRecipeCache.get_default("other_lib")
+            assert cache1 is not cache3
+
+            PersistentRecipeCache.clear_instances()
+
+    def test_loras_json_handling(self, temp_db_path):
+        """Test that complex loras data is preserved."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        recipes = [
+            {
+                "id": "complex-001",
+                "title": "Complex Loras",
+                "loras": [
+                    {
+                        "hash": "abc123",
+                        "file_name": "test_lora",
+                        "strength": 0.75,
+                        "modelVersionId": 12345,
+                        "modelName": "Test Model",
+                        "isDeleted": False,
+                    },
+                    {
+                        "hash": "def456",
+                        "file_name": "another_lora",
+                        "strength": 1.0,
+                        "clip_strength": 0.8,
+                    },
+                ],
+            }
+        ]
+        cache.save_cache(recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        loras = loaded.raw_data[0]["loras"]
+        assert len(loras) == 2
+        assert loras[0]["modelVersionId"] == 12345
+        assert loras[1]["clip_strength"] == 0.8
+
+    # =============================================================================
+    # Tests for concurrent access (from Phase 2 improvement plan)
+    # =============================================================================
+
+    def test_concurrent_reads_do_not_corrupt_data(self, temp_db_path, sample_recipes):
+        """Verify concurrent reads don't corrupt database state."""
+        import threading
+        import time
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        results = []
+        errors = []
+
+        def read_operation():
+            try:
+                for _ in range(10):
+                    loaded = cache.load_cache()
+                    if loaded is not None:
+                        results.append(len(loaded.raw_data))
+                    time.sleep(0.01)
+            except Exception as e:
+                errors.append(str(e))
+
+        # Start multiple reader threads
+        threads = [threading.Thread(target=read_operation) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should occur
+        assert len(errors) == 0, f"Errors during concurrent reads: {errors}"
+        # All reads should return consistent data
+        assert all(count == 2 for count in results), "Inconsistent read results"
+
+    def test_concurrent_write_and_read(self, temp_db_path, sample_recipes):
+        """Verify thread safety under concurrent writes and reads."""
+        import threading
+        import time
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        write_errors = []
+        read_errors = []
+        write_count = [0]
+
+        def write_operation():
+            try:
+                for i in range(5):
+                    recipe = {
+                        "id": f"concurrent-{i}",
+                        "title": f"Concurrent Recipe {i}",
+                    }
+                    cache.update_recipe(recipe)
+                    write_count[0] += 1
+                    time.sleep(0.02)
+            except Exception as e:
+                write_errors.append(str(e))
+
+        def read_operation():
+            try:
+                for _ in range(10):
+                    cache.load_cache()
+                    cache.get_recipe_count()
+                    time.sleep(0.01)
+            except Exception as e:
+                read_errors.append(str(e))
+
+        # Mix of read and write threads
+        threads = (
+            [threading.Thread(target=write_operation) for _ in range(2)]
+            + [threading.Thread(target=read_operation) for _ in range(3)]
+        )
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should occur
+        assert len(write_errors) == 0, f"Write errors: {write_errors}"
+        assert len(read_errors) == 0, f"Read errors: {read_errors}"
+        # Writes should complete successfully
+        assert write_count[0] > 0
+
+    def test_concurrent_updates_to_same_recipe(self, temp_db_path):
+        """Verify concurrent updates to the same recipe don't corrupt data."""
+        import threading
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        # Initialize with one recipe
+        initial_recipe = {
+            "id": "concurrent-update",
+            "title": "Initial Title",
+            "version": 1,
+        }
+        cache.save_cache([initial_recipe])
+
+        errors = []
+        successful_updates = []
+
+        def update_operation(thread_id):
+            try:
+                for i in range(5):
+                    recipe = {
+                        "id": "concurrent-update",
+                        "title": f"Title from thread {thread_id} update {i}",
+                        "version": i + 1,
+                    }
+                    cache.update_recipe(recipe)
+                    successful_updates.append((thread_id, i))
+            except Exception as e:
+                errors.append(f"Thread {thread_id}: {e}")
+
+        # Multiple threads updating the same recipe
+        threads = [
+            threading.Thread(target=update_operation, args=(i,)) for i in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should occur
+        assert len(errors) == 0, f"Update errors: {errors}"
+        # All updates should complete
+        assert len(successful_updates) == 15
+
+        # Final state should be valid
+        final_count = cache.get_recipe_count()
+        assert final_count == 1
+
+    def test_schema_initialization_thread_safety(self, temp_db_path):
+        """Verify schema initialization is thread-safe."""
+        import threading
+
+        errors = []
+        initialized_caches = []
+
+        def create_cache():
+            try:
+                cache = PersistentRecipeCache(db_path=temp_db_path)
+                initialized_caches.append(cache)
+            except Exception as e:
+                errors.append(str(e))
+
+        # Multiple threads creating cache simultaneously
+        threads = [threading.Thread(target=create_cache) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should occur
+        assert len(errors) == 0, f"Initialization errors: {errors}"
+        # All caches should be created
+        assert len(initialized_caches) == 5
+
+    def test_concurrent_save_and_remove(self, temp_db_path, sample_recipes):
+        """Verify concurrent save and remove operations don't corrupt database."""
+        import threading
+        import time
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        errors = []
+        operation_counts = {"saves": 0, "removes": 0}
+
+        def save_operation():
+            try:
+                for i in range(5):
+                    recipes = [
+                        {"id": f"recipe-{j}", "title": f"Recipe {j}"}
+                        for j in range(i * 2, i * 2 + 2)
+                    ]
+                    cache.save_cache(recipes)
+                    operation_counts["saves"] += 1
+                    time.sleep(0.015)
+            except Exception as e:
+                errors.append(f"Save error: {e}")
+
+        def remove_operation():
+            try:
+                for i in range(5):
+                    cache.remove_recipe(f"recipe-{i}")
+                    operation_counts["removes"] += 1
+                    time.sleep(0.02)
+            except Exception as e:
+                errors.append(f"Remove error: {e}")
+
+        # Concurrent save and remove threads
+        threads = [
+            threading.Thread(target=save_operation),
+            threading.Thread(target=remove_operation),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should occur
+        assert len(errors) == 0, f"Operation errors: {errors}"
+        # Operations should complete
+        assert operation_counts["saves"] == 5
+        assert operation_counts["removes"] == 5
+
+    # -----------------------------------------------------------------------
+    # image_id_map persistence (Phase 1 improvement)
+    # -----------------------------------------------------------------------
+
+    def test_save_and_load_image_id_map_roundtrip(self, temp_db_path, sample_recipes):
+        """Save image_id_map via save_cache() and verify it round-trips through load_cache()."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        image_id_map = {
+            "12345": "recipe-alpha",
+            "67890": "recipe-beta",
+        }
+        cache.save_cache(sample_recipes, image_id_map=image_id_map)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == image_id_map
+
+    def test_load_without_image_id_map_returns_empty_dict(self, temp_db_path, sample_recipes):
+        """Loading from a cache that has no image_id_map metadata must yield {}."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        # Save without image_id_map
+        cache.save_cache(sample_recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == {}
+
+    def test_save_cache_without_image_id_map_does_not_corrupt_existing(
+        self, temp_db_path, sample_recipes,
+    ):
+        """Overwriting cache without passing image_id_map must not leave stale data.
+
+        The previous image_id_map entry in cache_metadata should be replaced with {}.
+        """
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        cache.save_cache(sample_recipes, image_id_map={"123": "old-recipe"})
+        # Overwrite without image_id_map
+        cache.save_cache(sample_recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == {}
+
+    def test_image_id_map_survives_recipe_update(self, temp_db_path, sample_recipes):
+        """Updating a single recipe must not drop the image_id_map metadata."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        cache.save_cache(sample_recipes, image_id_map={"123": "recipe-alpha"})
+
+        updated = dict(sample_recipes[0])
+        updated["title"] = "Updated"
+        cache.update_recipe(updated)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == {"123": "recipe-alpha"}
+
+    def test_save_image_id_map_persists_without_full_save(self, temp_db_path, sample_recipes):
+        """save_image_id_map must update cache_metadata without rewriting all recipes."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes)
+
+        cache.save_image_id_map({"555": "new-recipe", "666": "another-recipe"})
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == {"555": "new-recipe", "666": "another-recipe"}
+
+    def test_save_image_id_map_overwrites_previous(self, temp_db_path, sample_recipes):
+        """Calling save_image_id_map twice must replace, not merge."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache(sample_recipes, image_id_map={"111": "old"})
+
+        cache.save_image_id_map({"222": "new-only"})
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.image_id_map == {"222": "new-only"}
+
+    def test_metadata_value_roundtrip(self, temp_db_path):
+        """set_metadata_value/get_metadata_value store and replace values."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        assert cache.get_metadata_value("source_path_backfilled") is None
+
+        cache.set_metadata_value("source_path_backfilled", "1")
+        assert cache.get_metadata_value("source_path_backfilled") == "1"
+
+        cache.set_metadata_value("source_path_backfilled", "2")
+        assert cache.get_metadata_value("source_path_backfilled") == "2"
+
+    def test_metadata_value_survives_save_cache(self, temp_db_path, sample_recipes):
+        """A full save_cache must not drop unrelated cache_metadata entries."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        cache.set_metadata_value("source_path_backfilled", "1")
+        cache.save_cache(sample_recipes)
+
+        assert cache.get_metadata_value("source_path_backfilled") == "1"
+
+
+class TestHasWorkflowColumn:
+    """has_workflow column persistence (plan 3.1)."""
+
+    def test_save_and_load_roundtrip(self, temp_db_path):
+        """has_workflow must round-trip through save_cache()/load_cache()."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        recipes = [
+            {"id": "wf-1", "title": "Has Workflow", "has_workflow": True},
+            {"id": "wf-2", "title": "No Workflow", "has_workflow": False},
+            {"id": "wf-3", "title": "Unset Workflow"},
+        ]
+        cache.save_cache(recipes)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        by_id = {r["id"]: r for r in loaded.raw_data}
+        assert by_id["wf-1"]["has_workflow"] is True
+        assert by_id["wf-2"]["has_workflow"] is False
+        assert by_id["wf-3"]["has_workflow"] is False
+
+    def test_prepare_recipe_row_matches_column_order(self, temp_db_path):
+        """The prepared row must append has_workflow/import_info in column order."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        row_true = cache._prepare_recipe_row({"id": "r1", "has_workflow": True}, "")
+        row_false = cache._prepare_recipe_row({"id": "r2", "has_workflow": False}, "")
+
+        assert row_true[-2] == 1
+        assert row_false[-2] == 0
+        # import_info_json is the trailing column, unset by default.
+        assert row_true[-1] is None
+        assert row_false[-1] is None
+        assert len(row_true) == len(cache._RECIPE_COLUMNS)
+        assert cache._RECIPE_COLUMNS[-2] == "has_workflow"
+        assert cache._RECIPE_COLUMNS[-1] == "import_info_json"
+
+    def test_update_recipe_preserves_has_workflow(self, temp_db_path):
+        """update_recipe() must write the has_workflow column correctly."""
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+        cache.save_cache([{"id": "wf-update", "title": "x", "has_workflow": True}])
+        cache.update_recipe({"id": "wf-update", "title": "y", "has_workflow": False})
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.raw_data[0]["has_workflow"] is False
+
+    def test_migrates_legacy_database_adds_has_workflow(self, temp_db_path):
+        """A database created before has_workflow existed must still load."""
+        import sqlite3
+
+        conn = sqlite3.connect(temp_db_path)
+        conn.execute(
+            """
+            CREATE TABLE recipes (
+                recipe_id TEXT PRIMARY KEY,
+                file_path TEXT,
+                json_path TEXT,
+                title TEXT,
+                folder TEXT,
+                source_path TEXT,
+                base_model TEXT,
+                fingerprint TEXT,
+                created_date REAL,
+                modified REAL,
+                file_mtime REAL,
+                file_size INTEGER,
+                favorite INTEGER DEFAULT 0,
+                preview_nsfw_level INTEGER DEFAULT 0,
+                loras_json TEXT,
+                checkpoint_json TEXT,
+                gen_params_json TEXT,
+                tags_json TEXT
+            )
+            """
+        )
+        conn.execute("INSERT INTO recipes (recipe_id, title) VALUES ('legacy-1', 'Legacy')")
+        conn.commit()
+        conn.close()
+
+        cache = PersistentRecipeCache(db_path=temp_db_path)
+
+        loaded = cache.load_cache()
+        assert loaded is not None
+        assert loaded.raw_data[0]["id"] == "legacy-1"
+        assert loaded.raw_data[0]["has_workflow"] is False

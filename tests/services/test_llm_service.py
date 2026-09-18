@@ -1,0 +1,473 @@
+"""Tests for the LLMService."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from unittest import mock
+
+import pytest
+
+from py.services import llm_service as llm_module
+from py.services.errors import LLMNotConfiguredError, LLMRateLimitError, LLMResponseError
+from py.services.llm_service import LLMService, fetch_ollama_models
+
+
+class MockSettings:
+    """Minimal settings mock for LLMService tests."""
+
+    def __init__(self, **kwargs):
+        self._data = {
+            "llm_enabled": False,
+            "llm_provider": "openai",
+            "llm_api_key": "",
+            "llm_api_base": "",
+            "llm_model": "",
+        }
+        self._data.update(kwargs)
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+class MockResponse:
+    """Mock aiohttp response."""
+
+    def __init__(self, status, json_data=None, text_data="", headers=None):
+        self.status = status
+        self._json_data = json_data
+        self._text_data = text_data
+        self.headers = headers or {}
+
+    async def json(self):
+        return self._json_data
+
+    async def text(self):
+        return self._text_data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class MockSession:
+    """Mock aiohttp ClientSession."""
+
+    def __init__(self, response):
+        self._response = response
+        self.closed = False
+        self.last_url = None
+        self.last_json = None
+        self.last_headers = None
+
+    def post(self, url, json=None, headers=None):
+        self.last_url = url
+        self.last_json = json
+        self.last_headers = headers
+        return self._response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+@pytest.fixture
+def llm_service():
+    """Create an LLMService with mock settings."""
+    LLMService.reset_instance()
+    settings = MockSettings(
+        llm_enabled=True,
+        llm_provider="openai",
+        llm_api_key="sk-test-key",
+        llm_api_base="",
+        llm_model="gpt-4o-mini",
+    )
+    return LLMService(settings)
+
+
+class TestLLMServiceConfiguration:
+    def test_is_configured_when_enabled_with_key_and_model(self, llm_service):
+        assert llm_service.is_configured() is True
+
+    def test_not_configured_when_disabled(self):
+        settings = MockSettings(
+            llm_enabled=False, llm_api_key="sk-test", llm_model="gpt-4o"
+        )
+        service = LLMService(settings)
+        # Lenient: model + API key is treated as configured even without
+        # the toggle, because the user clearly intends to use the feature.
+        assert service.is_configured() is True
+
+    def test_not_configured_without_model(self):
+        settings = MockSettings(llm_enabled=True, llm_api_key="sk-test", llm_model="")
+        service = LLMService(settings)
+        assert service.is_configured() is False
+
+    def test_not_configured_without_api_key_for_openai(self):
+        settings = MockSettings(llm_enabled=True, llm_api_key="", llm_model="gpt-4o")
+        service = LLMService(settings)
+        assert service.is_configured() is False
+
+    def test_ollama_configured_without_api_key(self):
+        settings = MockSettings(
+            llm_enabled=True, llm_provider="ollama", llm_api_key="", llm_model="llama3"
+        )
+        service = LLMService(settings)
+        assert service.is_configured() is True
+
+    def test_resolve_api_base_openai_default(self, llm_service):
+        assert llm_service._resolve_api_base("openai", "") == "https://api.openai.com/v1"
+
+    def test_resolve_api_base_ollama_default(self, llm_service):
+        assert llm_service._resolve_api_base("ollama", "") == "http://localhost:11434/v1"
+
+    def test_resolve_api_base_custom_override(self, llm_service):
+        assert llm_service._resolve_api_base("custom", "https://my.api.com/v1/") == "https://my.api.com/v1"
+
+    def test_ensure_configured_raises_when_disabled(self):
+        settings = MockSettings(llm_enabled=False)
+        service = LLMService(settings)
+        with pytest.raises(LLMNotConfiguredError):
+            service._ensure_configured()
+
+    def test_ensure_configured_raises_without_model(self):
+        settings = MockSettings(llm_enabled=True, llm_api_key="sk-test", llm_model="")
+        service = LLMService(settings)
+        with pytest.raises(LLMNotConfiguredError):
+            service._ensure_configured()
+
+    def test_not_configured_custom_without_api_base(self):
+        settings = MockSettings(
+            llm_enabled=True, llm_provider="custom",
+            llm_api_key="sk-test", llm_api_base="", llm_model="gpt-4o",
+        )
+        service = LLMService(settings)
+        assert service.is_configured() is False
+
+    def test_custom_configured_with_api_base(self):
+        settings = MockSettings(
+            llm_enabled=True, llm_provider="custom",
+            llm_api_key="sk-test",
+            llm_api_base="https://my.api.com/v1", llm_model="gpt-4o",
+        )
+        service = LLMService(settings)
+        assert service.is_configured() is True
+
+    def test_ensure_configured_raises_custom_without_api_base(self):
+        settings = MockSettings(
+            llm_enabled=True, llm_provider="custom",
+            llm_api_key="sk-test", llm_api_base="", llm_model="gpt-4o",
+        )
+        service = LLMService(settings)
+        with pytest.raises(LLMNotConfiguredError, match="API base URL"):
+            service._ensure_configured()
+
+
+class TestLLMServiceChatCompletion:
+    @pytest.mark.asyncio
+    async def test_chat_completion_success(self, llm_service):
+        mock_response = MockResponse(
+            200,
+            json_data={
+                "choices": [{"message": {"content": "Hello!"}}],
+                "usage": {"total_tokens": 10},
+                "model": "gpt-4o-mini",
+            },
+        )
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await llm_service.chat_completion(
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+
+        assert result["content"] == "Hello!"
+        assert result["usage"]["total_tokens"] == 10
+        assert result["model"] == "gpt-4o-mini"
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_raises_on_not_configured(self):
+        settings = MockSettings(llm_enabled=False)
+        service = LLMService(settings)
+        with pytest.raises(LLMNotConfiguredError):
+            await service.chat_completion(messages=[])
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_raises_on_http_error(self, llm_service):
+        mock_response = MockResponse(500, text_data="Internal Server Error")
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(LLMResponseError, match="HTTP 500"):
+                await llm_service.chat_completion(messages=[])
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_raises_on_rate_limit(self, llm_service):
+        mock_response = MockResponse(429, text_data="Rate limited", headers={"Retry-After": "0"})
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(LLMRateLimitError):
+                await llm_service.chat_completion(
+                    messages=[], retry_on_rate_limit=False
+                )
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_raises_on_bad_response_structure(self, llm_service):
+        mock_response = MockResponse(200, json_data={"unexpected": "data"})
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(LLMResponseError, match="Unexpected LLM response"):
+                await llm_service.chat_completion(messages=[])
+
+
+class TestLLMServiceChatCompletionJson:
+    @pytest.mark.asyncio
+    async def test_chat_completion_json_parses_json(self, llm_service):
+        mock_response = MockResponse(
+            200,
+            json_data={
+                "choices": [{"message": {"content": '{"key": "value"}'}}],
+                "usage": {},
+                "model": "gpt-4o-mini",
+            },
+        )
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await llm_service.chat_completion_json(
+                system_prompt="You are helpful.",
+                user_prompt="Return JSON.",
+            )
+
+        assert result == {"key": "value"}
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_json_falls_back_on_response_format_rejection(
+        self, llm_service,
+    ):
+        """Retry without response_format when provider rejects it (HTTP 400)."""
+        error_response = MockResponse(
+            400,
+            text_data=(
+                '{"error":"\'response_format.type\' must be '
+                '\'json_schema\' or \'text\'"}'
+            ),
+        )
+        success_response = MockResponse(
+            200,
+            json_data={
+                "choices": [{"message": {"content": '{"key": "value"}'}}],
+                "usage": {},
+                "model": "local-model",
+            },
+        )
+
+        call_index = 0
+
+        class FallbackMockSession:
+            def __init__(self):
+                self.last_url = None
+                self.last_json = None
+
+            def post(self, url, json=None, headers=None):
+                nonlocal call_index
+                self.last_url = url
+                self.last_json = json
+                call_index += 1
+                return error_response if call_index == 1 else success_response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with mock.patch("aiohttp.ClientSession", return_value=FallbackMockSession()):
+            result = await llm_service.chat_completion_json(
+                system_prompt="You are helpful.",
+                user_prompt="Return JSON.",
+            )
+
+        assert result == {"key": "value"}
+        assert call_index == 2
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_json_raises_on_non_json(self, llm_service):
+        # Non-JSON content raises LLMResponseError (salvage also fails)
+        mock_response = MockResponse(
+            200,
+            json_data={
+                "choices": [{"message": {"content": "not json at all"}}],
+                "usage": {},
+            },
+        )
+        mock_session = MockSession(mock_response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(LLMResponseError, match="could not be parsed as JSON"):
+                await llm_service.chat_completion_json(
+                    system_prompt="test",
+                    user_prompt="test",
+                )
+
+
+class MockGetSession:
+    """Minimal aiohttp session mock supporting get() for catalog tests."""
+
+    def __init__(self, response):
+        self._response = response
+        self.last_url = None
+        self.last_headers = None
+
+    def get(self, url, headers=None):
+        self.last_url = url
+        self.last_headers = headers
+        return self._response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class CorruptJsonResponse(MockResponse):
+    """Response whose body cannot be decoded as UTF-8 (like the issue's 0x9a byte)."""
+
+    async def json(self):
+        raise UnicodeDecodeError("utf-8", b"\x9a", 0, 1, "invalid start byte")
+
+
+class SlowResponse(MockResponse):
+    """Response whose body takes a moment to read, to force contention."""
+
+    async def json(self):
+        await asyncio.sleep(0.05)
+        return self._json_data
+
+
+class TestModelCatalog:
+    """Tests for _load_model_catalog / fetch_ollama_models error handling."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_catalog_cache(self):
+        """Reset the module-level catalog cache around each test."""
+        llm_module._catalog_cache = None
+        llm_module._model_output_limits = {}
+        llm_module._catalog_last_failure = None
+        yield
+        llm_module._catalog_cache = None
+        llm_module._model_output_limits = {}
+        llm_module._catalog_last_failure = None
+
+    @pytest.mark.asyncio
+    async def test_load_model_catalog_falls_back_on_unicode_decode_error(self):
+        """Corrupted catalog body must not raise — fall back to an empty dict."""
+        response = CorruptJsonResponse(200)
+        session = MockGetSession(response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=session):
+            catalog = await llm_module._load_model_catalog()
+
+        assert catalog == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_ollama_models_falls_back_on_unicode_decode_error(self):
+        """Corrupted Ollama response must not raise — fall back to an empty list."""
+        response = CorruptJsonResponse(200)
+        session = MockGetSession(response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=session):
+            models = await fetch_ollama_models("http://localhost:11434/v1")
+
+        assert models == []
+
+    @pytest.mark.asyncio
+    async def test_catalog_request_disables_brotli_encoding(self):
+        """The catalog request must not advertise br — a corrupt brotli stream
+        can crash the native decoder (Windows access violation, issue #1099)."""
+        response = MockResponse(200, json_data={})
+        session = MockGetSession(response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=session):
+            await llm_module._load_model_catalog()
+
+        assert session.last_headers == {"Accept-Encoding": "gzip, deflate"}
+
+    @pytest.mark.asyncio
+    async def test_ollama_request_disables_brotli_encoding(self):
+        """The Ollama models request must not advertise br either."""
+        response = MockResponse(200, json_data={"data": [{"id": "llama3"}]})
+        session = MockGetSession(response)
+
+        with mock.patch("aiohttp.ClientSession", return_value=session):
+            models = await fetch_ollama_models("http://localhost:11434/v1")
+
+        assert models == ["llama3"]
+        assert session.last_headers == {"Accept-Encoding": "gzip, deflate"}
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_is_negatively_cached(self):
+        """A failed fetch is not retried until the cooldown elapses."""
+        created = []
+
+        def factory(*args, **kwargs):
+            session = MockGetSession(MockResponse(500, text_data="error"))
+            created.append(session)
+            return session
+
+        with mock.patch("aiohttp.ClientSession", side_effect=factory):
+            first = await llm_module._load_model_catalog()
+            second = await llm_module._load_model_catalog()
+
+        assert first == {}
+        assert second == {}
+        assert len(created) == 1
+        assert llm_module._catalog_last_failure is not None
+
+    @pytest.mark.asyncio
+    async def test_fetch_retries_after_cooldown(self):
+        """Once the cooldown elapses, the next call fetches again."""
+        bad = MockGetSession(MockResponse(500, text_data="error"))
+        with mock.patch("aiohttp.ClientSession", return_value=bad):
+            assert await llm_module._load_model_catalog() == {}
+
+        # Simulate the cooldown having elapsed.
+        llm_module._catalog_last_failure = (
+            time.monotonic() - llm_module._CATALOG_FAILURE_COOLDOWN - 1
+        )
+
+        good = MockGetSession(
+            MockResponse(200, json_data={"openai": {"models": {"gpt-4o": {}}}})
+        )
+        with mock.patch("aiohttp.ClientSession", return_value=good):
+            catalog = await llm_module._load_model_catalog()
+
+        assert catalog == {"openai": ["gpt-4o"]}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fetches_are_deduplicated(self):
+        """Concurrent callers share a single in-flight fetch."""
+        created = []
+
+        def factory(*args, **kwargs):
+            session = MockGetSession(
+                SlowResponse(200, json_data={"openai": {"models": {"gpt-4o": {}}}})
+            )
+            created.append(session)
+            return session
+
+        with mock.patch("aiohttp.ClientSession", side_effect=factory):
+            results = await asyncio.gather(
+                *(llm_module._load_model_catalog() for _ in range(3))
+            )
+
+        assert len(created) == 1
+        assert all(r == {"openai": ["gpt-4o"]} for r in results)

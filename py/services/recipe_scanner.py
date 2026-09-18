@@ -1,0 +1,4669 @@
+# pyright: reportImportCycles=false
+# Lazy (function-local) imports still count as static edges in basedpyright's
+# reportImportCycles, so the ServiceRegistry singleton pattern necessarily forms
+# import cycles. Breaking them would require an architectural refactor.
+from __future__ import annotations
+
+import asyncio
+import copy
+import difflib
+import json
+import logging
+import os
+import random
+import time
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union, cast
+from ..config import config
+from ..utils.constants import VALID_CHECKPOINT_SUB_TYPES, VALID_LORA_TYPES
+from ..utils.exif_utils import ExifUtils
+from ..utils.file_utils import calculate_autov3
+from ..utils.recipe_open_stats import RecipeOpenStats
+from .model_scanner import WEIGHT_FILE_EXTENSIONS
+from .recipe_cache import RecipeCache
+from .recipes.errors import (
+    RecipeNotFoundError,
+    RecipePersistenceError,
+    RecipeValidationError,
+)
+from .websocket_manager import ws_manager
+from natsort import natsorted
+import sys
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .lora_scanner import LoraScanner
+    from .checkpoint_scanner import CheckpointScanner
+    from .recipe_fts_index import RecipeFTSIndex
+    from .persistent_recipe_cache import PersistentRecipeCache, PersistedRecipeData
+
+logger = logging.getLogger(__name__)
+
+# Rematch type-gate alias map: Civitai model types are lowercased before the
+# VALID_CHECKPOINT_SUB_TYPES membership check, and raw "DiffusionModel" would
+# lowercase to "diffusionmodel", which is not a valid sub-type. Map it
+# explicitly to "diffusion_model" (mirrors Oracle R2-F1).
+_CHECKPOINT_MODEL_TYPE_ALIASES = {"diffusionmodel": "diffusion_model"}
+
+# Valid LoRA availability statuses for the recipe listing filter.
+_VALID_LORA_AVAILABILITY_STATUSES = frozenset({"ready", "missing", "deleted"})
+
+# Filter marker for recipes whose base model could not be determined
+# (base_model is None or empty). The UI displays "Unknown" for this bucket;
+# the marker keeps the semantics explicit and disjoint from any real base
+# model string.
+UNKNOWN_BASE_MODEL_FILTER = "__unknown__"
+
+
+class RecipeScanner:
+    """Service for scanning and managing recipe images"""
+
+    _instance = None
+    _lock = asyncio.Lock()
+
+    @classmethod
+    async def get_instance(
+        cls,
+        lora_scanner: Optional[LoraScanner] = None,
+        checkpoint_scanner: Optional[CheckpointScanner] = None,
+    ):
+        """Get singleton instance of RecipeScanner"""
+        async with cls._lock:
+            if cls._instance is None:
+                if not lora_scanner:
+                    # Get lora scanner from service registry if not provided
+                    from .service_registry import ServiceRegistry
+
+                    lora_scanner = await ServiceRegistry.get_lora_scanner()
+                if not checkpoint_scanner:
+                    from .service_registry import ServiceRegistry
+
+                    checkpoint_scanner = await ServiceRegistry.get_checkpoint_scanner()
+                cls._instance = cls(lora_scanner, checkpoint_scanner)
+            return cls._instance
+
+    def __new__(
+        cls,
+        lora_scanner: Optional[LoraScanner] = None,
+        checkpoint_scanner: Optional[CheckpointScanner] = None,
+    ):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._lora_scanner = lora_scanner
+            cls._instance._checkpoint_scanner = checkpoint_scanner
+            cls._instance._civitai_client = None  # Will be lazily initialized
+        return cls._instance
+
+    def __init__(
+        self,
+        lora_scanner: Optional[LoraScanner] = None,
+        checkpoint_scanner: Optional[CheckpointScanner] = None,
+    ):
+        # Ensure initialization only happens once
+        if not hasattr(self, "_initialized"):
+            self._cache: Optional[RecipeCache] = None
+            self._initialization_lock = asyncio.Lock()
+            self._initialization_task: Optional[asyncio.Task[Any]] = None
+            self._is_initializing = False
+            self._mutation_lock = asyncio.Lock()
+            self._post_scan_task: Optional[asyncio.Task[Any]] = None
+            self._resort_tasks: Set[asyncio.Task[Any]] = set()
+            self._cancel_requested = False
+            # FTS index for fast search
+            self._fts_index: Optional[RecipeFTSIndex] = None
+            self._fts_index_task: Optional[asyncio.Task[Any]] = None
+            # Persistent cache for fast startup
+            self._persistent_cache: Optional[PersistentRecipeCache] = None
+            self._civitai_client: Any = None  # Lazily initialized from registry
+            self._json_path_map: Dict[str, str] = {}  # recipe_id -> json_path
+            if lora_scanner:
+                self._lora_scanner = lora_scanner
+            if checkpoint_scanner:
+                self._checkpoint_scanner = checkpoint_scanner
+            # Local hash cache (sha256 / autov2 / stored autov3 -> cache item),
+            # rebuilt only when either model scanner's cache_version changes.
+            self._local_hash_cache: dict[str, dict[str, Any]] | None = None
+            self._local_hash_cache_versions: tuple[int, int] | None = None
+            self._local_hash_cache_lock = asyncio.Lock()
+            # Computed autov3 map (absent/None-autov3 items only), rebuilt only
+            # when either model scanner's cache_version changes — the
+            # safetensors headers are read once per library scan, not once per
+            # recipe. Mirrors the build_local_hash_cache version pattern.
+            self._rematch_autov3_cache: dict[str, dict[str, Any]] | None = None
+            self._rematch_autov3_versions: tuple[int, int] | None = None
+            self._rematch_autov3_lock = asyncio.Lock()
+            # Normalized filename -> [items] map for the L4 rematch fallback,
+            # rebuilt only when either model scanner's cache_version changes.
+            # Mirrors the build_local_hash_cache version pattern.
+            self._local_filename_cache: dict[str, list[dict[str, Any]]] | None = None
+            self._local_filename_cache_versions: tuple[int, int] | None = None
+            self._local_filename_cache_lock = asyncio.Lock()
+            self._initialized = True
+
+    async def build_local_hash_cache(self) -> dict[str, dict[str, Any]]:
+        """Build a version-cached map of local model hashes to cache items.
+
+        Keys are the lowercase full sha256, the first 10 chars of the sha256
+        (autov2), and the stored lowercase autov3 value when present. An empty
+        autov3 is the "checked but unavailable" state and never produces a key.
+        Items without a sha256 are skipped. The dict is reused while both
+        scanners' cache_version values are unchanged; concurrent callers share
+        a single build via the lock.
+        """
+        async with self._local_hash_cache_lock:
+            lora_scanner = self._lora_scanner
+            checkpoint_scanner = self._checkpoint_scanner
+            versions = (
+                lora_scanner.cache_version if lora_scanner is not None else 0,
+                checkpoint_scanner.cache_version
+                if checkpoint_scanner is not None
+                else 0,
+            )
+            if (
+                self._local_hash_cache is not None
+                and self._local_hash_cache_versions == versions
+            ):
+                return self._local_hash_cache
+
+            cache: dict[str, dict[str, Any]] = {}
+            for scanner in (lora_scanner, checkpoint_scanner):
+                if scanner is None:
+                    continue
+                data = await scanner.get_cached_data()
+                for item in data.raw_data:
+                    sha256 = (item.get("sha256") or "").lower()
+                    if not sha256:
+                        continue
+                    cache[sha256] = item
+                    cache[sha256[:10]] = item
+                    autov3 = (item.get("autov3") or "").lower()
+                    if autov3:
+                        cache[autov3] = item
+
+            self._local_hash_cache = cache
+            self._local_hash_cache_versions = versions
+            return cache
+
+    @staticmethod
+    def _normalize_filename_key(name: str) -> str:
+        """Normalize a file name to a lookup key (basename, lowercase).
+
+        Only known weight-file extensions are stripped — names are stored
+        extensionless on both sides, so splitext would misread dotted stems
+        ("my.mix" -> "my") and collide distinct models. The extension set is
+        shared with ModelScanner.find_matching_models, and is iterated longest
+        first to keep the strip ordering identical to that function.
+        """
+        if not name:
+            return ""
+        basename = os.path.basename(name.replace("\\", "/"))
+        lower = basename.lower()
+        for ext in sorted(WEIGHT_FILE_EXTENSIONS, key=len, reverse=True):
+            if lower.endswith(ext):
+                basename = basename[: -len(ext)]
+                break
+        return basename.strip().lower()
+
+    async def _build_local_filename_cache(self) -> dict[str, list[dict[str, Any]]]:
+        """Build a version-cached map of normalized file names to local items.
+
+        Keys are lowercase basenames without extension. Values are lists of
+        items (lora + checkpoint, type-blind) sharing that name. Only items
+        with a sha256 are indexed — matching a pending or failed download
+        (empty sha256) would leave the entry without a usable hash. The dict
+        is reused while both scanners' cache_version values are unchanged;
+        concurrent callers share a single build via the lock.
+        """
+        async with self._local_filename_cache_lock:
+            lora_scanner = self._lora_scanner
+            checkpoint_scanner = self._checkpoint_scanner
+            versions = (
+                lora_scanner.cache_version if lora_scanner is not None else 0,
+                checkpoint_scanner.cache_version
+                if checkpoint_scanner is not None
+                else 0,
+            )
+            if (
+                self._local_filename_cache is not None
+                and self._local_filename_cache_versions == versions
+            ):
+                return self._local_filename_cache
+
+            cache: dict[str, list[dict[str, Any]]] = {}
+            for scanner in (lora_scanner, checkpoint_scanner):
+                if scanner is None:
+                    continue
+                data = await scanner.get_cached_data()
+                for item in data.raw_data:
+                    if not isinstance(item, dict):
+                        continue
+                    if not (item.get("sha256") or "").lower():
+                        continue
+                    file_path = item.get("file_path") or ""
+                    file_name = item.get("file_name") or ""
+                    key = self._normalize_filename_key(file_name or file_path)
+                    if not key:
+                        continue
+                    cache.setdefault(key, []).append(item)
+
+            self._local_filename_cache = cache
+            self._local_filename_cache_versions = versions
+            return cache
+
+    @staticmethod
+    def _strip_weight_extension(name: str) -> str:
+        """Strip a known weight-file extension, preserving the original case."""
+        lower = name.lower()
+        for ext in sorted(WEIGHT_FILE_EXTENSIONS, key=len, reverse=True):
+            if lower.endswith(ext):
+                return name[: -len(ext)]
+        return name
+
+    async def suggest_reconnect_candidates(
+        self,
+        *,
+        entry: dict[str, Any],
+        recipe_base_model: Optional[str],
+        query: Optional[str] = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Rank local LoRAs as reconnect candidates for a broken recipe entry.
+
+        Thin wrapper over ``_suggest_reconnect_candidates`` scoped to the
+        LoRA library (see it for the ranking contract).
+        """
+        return await self._suggest_reconnect_candidates(
+            entry=entry,
+            recipe_base_model=recipe_base_model,
+            query=query,
+            limit=limit,
+            is_checkpoint=False,
+        )
+
+    async def suggest_checkpoint_reconnect_candidates(
+        self,
+        *,
+        entry: dict[str, Any],
+        recipe_base_model: Optional[str],
+        query: Optional[str] = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Rank local checkpoints as reconnect candidates for a broken entry.
+
+        Thin wrapper over ``_suggest_reconnect_candidates`` scoped to the
+        checkpoint library (see it for the ranking contract).
+        """
+        return await self._suggest_reconnect_candidates(
+            entry=entry,
+            recipe_base_model=recipe_base_model,
+            query=query,
+            limit=limit,
+            is_checkpoint=True,
+        )
+
+    async def _suggest_reconnect_candidates(
+        self,
+        *,
+        entry: dict[str, Any],
+        recipe_base_model: Optional[str],
+        query: Optional[str] = None,
+        limit: int = 5,
+        is_checkpoint: bool,
+    ) -> list[dict[str, Any]]:
+        """Rank local models as reconnect candidates for a broken recipe entry.
+
+        Identity signals (same hash / same CivitAI model version) outrank
+        similarity signals (filename / model name fuzzy match). A confident
+        base-model mismatch (both sides known and different) is a hard
+        rejection here. This is deliberately stricter than reconnect itself,
+        which tolerates same-architecture-family labels (Pony ↔ Illustrious):
+        suggestions trade recall for a noise-free list, and the input box
+        remains available for deliberate cross-family picks. Unknown on
+        either side stays eligible, matching ``find_matching_models``.
+        When ``query`` is given
+        (search-as-you-type), identity signals are skipped and both
+        similarity signals score against the query, with a substring hit
+        (query of 3+ chars) flooring that signal's ratio at 0.8.
+
+        The name-similarity threshold (0.65) is stricter than the filename
+        one (0.55): long generic names share tokens like "style"/"pony" and
+        score deceptively high (measured 0.638 for unrelated models), while
+        filenames are the authoritative match key and get more slack.
+        """
+        if limit <= 0 or not isinstance(entry, dict):
+            return []
+
+        scanner = self._checkpoint_scanner if is_checkpoint else self._lora_scanner
+        if scanner is None:
+            return []
+
+        data = await scanner.get_cached_data()
+        recipe_bm = (recipe_base_model or "").strip().casefold()
+
+        def _base_model_known_mismatch(item: dict[str, Any]) -> bool:
+            """Confident mismatch only — unknown on either side stays eligible."""
+            if not recipe_bm or recipe_bm == "unknown":
+                return False
+            item_bm = (item.get("base_model") or "").strip().casefold()
+            return bool(item_bm) and item_bm != "unknown" and item_bm != recipe_bm
+
+        def _base_model_adjustment(item: dict[str, Any]) -> float:
+            # Mismatches are already filtered out; this only boosts known-equal.
+            if not recipe_bm or recipe_bm == "unknown":
+                return 0.0
+            item_bm = (item.get("base_model") or "").strip().casefold()
+            return 0.1 if item_bm == recipe_bm else 0.0
+
+        pool: list[dict[str, Any]] = []
+        for item in getattr(data, "raw_data", None) or []:
+            if not isinstance(item, dict):
+                continue
+            # Items without a sha256 (pending/failed downloads) leave the
+            # entry without a usable hash — same rule as the filename cache.
+            if not (item.get("sha256") or "").strip():
+                continue
+            if not self._is_type_compatible(item, is_checkpoint=is_checkpoint):
+                continue
+            if _base_model_known_mismatch(item):
+                continue
+            pool.append(item)
+        if not pool:
+            return []
+
+        # Basename collision counts decide whether target_name needs the
+        # folder-relative path to resolve uniquely in find_matching_models.
+        basename_counts: dict[str, int] = {}
+        for item in pool:
+            key = self._normalize_filename_key(item.get("file_name") or "")
+            if key:
+                basename_counts[key] = basename_counts.get(key, 0) + 1
+
+        best: dict[str, dict[str, Any]] = {}
+
+        def _consider(item: dict[str, Any], score: float, reason: str) -> None:
+            key = item.get("file_path") or item.get("file_name") or ""
+            if not key:
+                return
+            current = best.get(key)
+            if current is None or score > current["score"]:
+                best[key] = {"item": item, "score": score, "reason": reason}
+
+        query_text = (query or "").strip()
+
+        if not query_text:
+            entry_hash = (entry.get("hash") or "").lower()
+            if entry_hash:
+                hash_cache = await self.build_local_hash_cache()
+                hit = hash_cache.get(entry_hash)
+                if (
+                    isinstance(hit, dict)
+                    and (hit.get("sha256") or "").strip()
+                    and self._is_type_compatible(hit, is_checkpoint=is_checkpoint)
+                    and not _base_model_known_mismatch(hit)
+                ):
+                    _consider(hit, 1.0 + _base_model_adjustment(hit), "same_hash")
+
+            version_id = entry.get("modelVersionId") or entry.get("id")
+            if version_id is not None:
+                if is_checkpoint:
+                    hit = self._get_checkpoint_from_version_index(str(version_id))
+                else:
+                    hit = self._get_lora_from_version_index(str(version_id))
+                if (
+                    isinstance(hit, dict)
+                    and (hit.get("sha256") or "").strip()
+                    and not _base_model_known_mismatch(hit)
+                ):
+                    _consider(hit, 0.95 + _base_model_adjustment(hit), "same_version")
+
+        filename_source = query_text or (entry.get("file_name") or "")
+        # Parser-style checkpoint entries carry the model name under ``name``,
+        # widget-style ones under ``modelName`` — try both for checkpoints.
+        if is_checkpoint:
+            name_source = query_text or (entry.get("name") or entry.get("modelName") or "")
+        else:
+            name_source = query_text or (entry.get("modelName") or "")
+        norm_filename_source = self._normalize_filename_key(filename_source)
+        name_source_cf = name_source.casefold()
+        # Substring hits floor the similarity ratio, but only for meaningful
+        # queries — a 1-2 character query is a substring of nearly every
+        # filename and would flood the suggestions with noise.
+        substring_floor = len(query_text) >= 3
+
+        for item in pool:
+            adjustment = _base_model_adjustment(item)
+
+            item_filename = self._normalize_filename_key(item.get("file_name") or "")
+            if norm_filename_source and item_filename:
+                ratio = difflib.SequenceMatcher(
+                    None, norm_filename_source, item_filename
+                ).ratio()
+                if substring_floor and norm_filename_source in item_filename:
+                    ratio = max(ratio, 0.8)
+                if ratio >= 0.55:
+                    _consider(
+                        item, 0.5 + 0.4 * ratio + adjustment, "similar_filename"
+                    )
+
+            item_name = (item.get("model_name") or "").casefold()
+            if name_source_cf and item_name:
+                ratio = difflib.SequenceMatcher(
+                    None, name_source_cf, item_name
+                ).ratio()
+                if substring_floor and name_source_cf in item_name:
+                    ratio = max(ratio, 0.8)
+                if ratio >= 0.65:
+                    _consider(item, 0.4 + 0.35 * ratio + adjustment, "similar_name")
+
+        suggestions = []
+        for record in best.values():
+            item = record["item"]
+            file_name = item.get("file_name") or ""
+            stem = self._strip_weight_extension(file_name)
+            folder = (item.get("folder") or "").replace("\\", "/").strip("/")
+            norm_key = self._normalize_filename_key(file_name)
+            if norm_key and basename_counts.get(norm_key, 0) > 1 and folder:
+                target_name = f"{folder}/{stem}"
+            else:
+                target_name = stem
+            suggestions.append(
+                {
+                    "file_name": file_name,
+                    "file_path": item.get("file_path") or "",
+                    "model_name": item.get("model_name") or "",
+                    "base_model": item.get("base_model") or "",
+                    "preview_url": item.get("preview_url") or "",
+                    "hash": (item.get("sha256") or "").lower(),
+                    "score": round(record["score"], 3),
+                    "match_reason": record["reason"],
+                    "target_name": target_name,
+                }
+            )
+
+        suggestions.sort(key=lambda s: (-s["score"], s["file_name"].lower()))
+        return suggestions[:limit]
+
+    def _is_rematch_candidate(
+        self, entry: dict[str, Any], relaxed: bool = False
+    ) -> bool:
+        """Return True when a recipe entry is eligible for local re-matching.
+
+        An entry counts as unresolved when its identity is known to be
+        broken (``isDeleted`` or ``hashInvalid``) or when it is missing
+        identity fields (``hash``/``file_name``). A healthy entry whose
+        hash is simply not present in the local library is NOT a candidate
+        in the default strict mode: it may be a recipe imported without
+        downloading the model yet, and its CivitAI-valid hash must never be
+        overwritten by the imprecise filename fallback.
+
+        With ``relaxed=True`` any entry carrying an identifier is a
+        candidate, including healthy ones — the caller opted into trying to
+        reconnect "Not in Library" entries by file name. Entries without
+        any identifier are never candidates in either mode.
+        """
+        if not isinstance(entry, dict):
+            return False
+        has_identifier = (
+            entry.get("hash")
+            or entry.get("modelVersionId")
+            or entry.get("id")
+            or entry.get("file_name")
+        )
+        if not has_identifier:
+            return False
+        if relaxed:
+            return True
+        unresolved = (
+            entry.get("isDeleted")
+            or entry.get("hashInvalid")
+            or not entry.get("hash")
+            or not entry.get("file_name")
+        )
+        return bool(unresolved)
+
+    async def _build_rematch_autov3_cache(self) -> dict[str, dict[str, Any]]:
+        """Build a version-cached map of computed AutoV3 hashes to local items.
+
+        Only absent/``None`` autov3 items are computed; ``''`` is the terminal
+        "checked but unavailable" state and is never recomputed. The dict is
+        reused while both scanners' cache_version values are unchanged, so the
+        safetensors headers are read once per library scan rather than once per
+        recipe. Computed values are lookup keys only — never persisted, never
+        written to items.
+        """
+        async with self._rematch_autov3_lock:
+            lora_scanner = self._lora_scanner
+            checkpoint_scanner = self._checkpoint_scanner
+            versions = (
+                lora_scanner.cache_version if lora_scanner is not None else 0,
+                checkpoint_scanner.cache_version
+                if checkpoint_scanner is not None
+                else 0,
+            )
+            if (
+                self._rematch_autov3_cache is not None
+                and self._rematch_autov3_versions == versions
+            ):
+                return self._rematch_autov3_cache
+
+            cache: dict[str, dict[str, Any]] = {}
+            for scanner in (lora_scanner, checkpoint_scanner):
+                if scanner is None:
+                    continue
+                data = await scanner.get_cached_data()
+                for item in data.raw_data:
+                    if not isinstance(item, dict):
+                        continue
+                    if "autov3" in item and item.get("autov3") is not None:
+                        continue
+                    file_path = item.get("file_path")
+                    if not file_path:
+                        continue
+                    computed = await asyncio.to_thread(calculate_autov3, file_path)
+                    key = (computed or "").lower()
+                    if key:
+                        cache[key] = item
+
+            self._rematch_autov3_cache = cache
+            self._rematch_autov3_versions = versions
+            return cache
+
+    def _is_type_compatible(self, item: dict[str, Any], *, is_checkpoint: bool) -> bool:
+        """Return True when a local item's type matches the entry kind.
+
+        The L1 hash cache and the L4 filename cache merge lora and checkpoint
+        items and are type-blind, so a match must be verified against the
+        entry kind before it is accepted.
+        """
+        sub_type = (item.get("sub_type") or "").lower()
+        if sub_type:
+            valid = (
+                VALID_CHECKPOINT_SUB_TYPES if is_checkpoint else VALID_LORA_TYPES
+            )
+            return sub_type in valid
+
+        civitai_type = (
+            (item.get("civitai") or {}).get("model", {}) or {}
+        ).get("type", "")
+        if civitai_type:
+            normalized = civitai_type.lower()
+            if is_checkpoint:
+                normalized = _CHECKPOINT_MODEL_TYPE_ALIASES.get(
+                    normalized, normalized
+                )
+                valid = VALID_CHECKPOINT_SUB_TYPES
+            else:
+                valid = VALID_LORA_TYPES
+            return normalized in valid
+        return True
+
+    @staticmethod
+    def _has_positive_type_evidence(item: dict[str, Any]) -> bool:
+        """Return True when the item carries an explicit type marker.
+
+        Lora raw items rarely carry ``sub_type`` (it is only written when
+        metadata provides it), while checkpoint items always do — so for
+        checkpoint slots a type-less candidate is a red flag, not the norm.
+        """
+        if (item.get("sub_type") or "").lower():
+            return True
+        civitai_type = (
+            (item.get("civitai") or {}).get("model", {}) or {}
+        ).get("type", "")
+        return bool(civitai_type)
+
+    def _match_rematch_entry_filename(
+        self,
+        entry: dict[str, Any],
+        recipe_base_model: Optional[str],
+        filename_cache: dict[str, list[dict[str, Any]]],
+        *,
+        is_checkpoint: bool,
+    ) -> Tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Match a recipe entry against local models by file name (L4).
+
+        Conservative fallback used only after the hash (L1), version-index
+        (L2) and computed-autov3 (L3) tiers all failed. Candidates share the
+        entry's normalized file name; a candidate is accepted only when BOTH
+        the recipe base model and the candidate's base model are known and
+        equal (unknown on either side rejects — never guess on missing
+        metadata), the type gate passes, and exactly one candidate survives
+        (ambiguity is a miss). Checkpoint slots additionally require positive
+        type evidence: lora raw items often lack ``sub_type`` while
+        checkpoints always carry it, so a type-less candidate is a red flag
+        there — an unknown-type lora must not be bound into a checkpoint
+        slot.
+
+        Returns:
+            Tuple of (matched item, "L4") — or ``(None, None)``.
+        """
+        entry_name = self._normalize_filename_key(entry.get("file_name") or "")
+        if not entry_name:
+            return (None, None)
+
+        recipe_base = (recipe_base_model or "").strip().lower()
+        matched: list[dict[str, Any]] = []
+        for candidate in filename_cache.get(entry_name, []):
+            candidate_base = (candidate.get("base_model") or "").strip().lower()
+            if not recipe_base or not candidate_base:
+                continue
+            if recipe_base != candidate_base:
+                continue
+            if is_checkpoint and not self._has_positive_type_evidence(candidate):
+                continue
+            if not self._is_type_compatible(candidate, is_checkpoint=is_checkpoint):
+                continue
+            matched.append(candidate)
+
+        if len(matched) != 1:
+            return (None, None)
+        return (matched[0], "L4")
+
+    async def _match_rematch_entry(
+        self,
+        entry: dict[str, Any],
+        local_cache: dict[str, Any],
+        autov3_cache: dict[str, Any],
+        *,
+        is_checkpoint: bool,
+    ) -> Optional[dict[str, Any]]:
+        """Match a recipe entry against local models (see
+        ``_match_rematch_entry_with_level`` for the level-aware variant).
+
+        Kept as a thin wrapper so callers that only need the matched item
+        (and the direct tests of this method) keep a stable contract.
+        """
+        item, _level = await self._match_rematch_entry_with_level(
+            entry, local_cache, autov3_cache, is_checkpoint=is_checkpoint
+        )
+        return item
+
+    async def _match_rematch_entry_with_level(
+        self,
+        entry: dict[str, Any],
+        local_cache: dict[str, Any],
+        autov3_cache: dict[str, Any],
+        *,
+        is_checkpoint: bool,
+        filename_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
+        recipe_base_model: Optional[str] = None,
+    ) -> Tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Match a recipe entry against local models across four levels.
+
+        L1 looks the stored hash up in the type-blind local hash cache; L2
+        falls back to the version index via ``modelVersionId`` or ``id``; L3
+        resolves 12-char hashes through the computed AutoV3 cache; L4
+        (conservative) falls back to the file name when a filename cache is
+        provided. Matched items are type-verified against the entry kind
+        before being returned.
+
+        Returns:
+            Tuple of (matched item, match level) where level is "L1", "L2",
+            "L3" or "L4" — or ``(None, None)`` when no usable match exists. A
+            missing local match is an expected outcome (the model may simply
+            not be present locally), not an error.
+        """
+        entry_hash = (entry.get("hash") or "").lower()
+
+        item = local_cache.get(entry_hash)
+        level = "L1" if item is not None else None
+
+        if item is None:
+            version_id = entry.get("modelVersionId") or entry.get("id")
+            if version_id is not None:
+                if is_checkpoint:
+                    item = self._get_checkpoint_from_version_index(str(version_id))
+                else:
+                    item = self._get_lora_from_version_index(str(version_id))
+                level = "L2" if item is not None else None
+
+        if item is None and len(entry_hash) == 12:
+            item = autov3_cache.get(entry_hash)
+            level = "L3" if item is not None else None
+
+        if item is None and filename_cache is not None:
+            item, level = self._match_rematch_entry_filename(
+                entry,
+                recipe_base_model,
+                filename_cache,
+                is_checkpoint=is_checkpoint,
+            )
+            level = "L4" if item is not None else None
+
+        if item is None:
+            return (None, None)
+
+        if not self._is_type_compatible(item, is_checkpoint=is_checkpoint):
+            return (None, None)
+
+        return (item, level)
+
+    @staticmethod
+    def _entry_identifier(entry: dict[str, Any]) -> str:
+        """Best-effort human-readable identifier for a recipe entry.
+
+        Used for rematch reports and debug logs; falls back through the keys
+        that carry the most recognisable information first.
+        """
+        for key in ("modelName", "name", "file_name", "hash", "modelVersionId"):
+            value = entry.get(key)
+            if value:
+                return str(value)
+        return "unknown"
+
+    def is_initializing(self) -> bool:
+        """Check if the scanner is currently initializing"""
+        return self._is_initializing
+
+    def on_library_changed(self) -> None:
+        """Reset cached state when the active library changes."""
+
+        # Cancel any in-flight initialization or resorting work so the next
+        # access rebuilds the cache for the new library.
+        if self._initialization_task and not self._initialization_task.done():
+            self._initialization_task.cancel()
+
+        for task in list(self._resort_tasks):
+            if not task.done():
+                task.cancel()
+        self._resort_tasks.clear()
+
+        if self._post_scan_task and not self._post_scan_task.done():
+            self._post_scan_task.cancel()
+        self._post_scan_task = None
+
+        # Cancel FTS index task and clear index
+        if self._fts_index_task and not self._fts_index_task.done():
+            self._fts_index_task.cancel()
+        self._fts_index_task = None
+        if self._fts_index:
+            self._fts_index.clear()
+        self._fts_index = None
+
+        # Reset persistent cache instance for new library
+        self._persistent_cache = None
+        self._json_path_map = {}
+        from .persistent_recipe_cache import PersistentRecipeCache
+
+        PersistentRecipeCache.clear_instances()
+
+        self._cache = None
+        self._initialization_task = None
+        self._is_initializing = False
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and not loop.is_closed():
+            loop.create_task(self.initialize_in_background())
+
+    async def _get_civitai_client(self):
+        """Lazily initialize CivitaiClient from registry"""
+        if self._civitai_client is None:
+            from .service_registry import ServiceRegistry
+
+            self._civitai_client = await ServiceRegistry.get_civitai_client()
+        return self._civitai_client
+
+    def cancel_task(self) -> None:
+        """Request cancellation of the current long-running task."""
+        self._cancel_requested = True
+        logger.info("Recipe Scanner: Cancellation requested")
+
+    def reset_cancellation(self) -> None:
+        """Reset the cancellation flag."""
+        self._cancel_requested = False
+
+    def is_cancelled(self) -> bool:
+        """Check if cancellation has been requested."""
+        return self._cancel_requested
+
+    async def rematch_recipe_by_id(
+        self, recipe_id: str, *, relaxed: bool = False
+    ) -> Dict[str, Any]:
+        """Rematch a single recipe's deleted lora/checkpoint entries locally.
+
+        Logs one INFO summary line for this run and delegates the per-recipe
+        work to ``_rematch_recipe_by_id`` (shared with the bulk entry point).
+
+        Args:
+            recipe_id: ID of the recipe to rematch
+            relaxed: When True, healthy entries are rematch candidates too
+                (see ``_rematch_single_recipe``).
+
+        Returns:
+            Dict summary of the rematch result (see ``_rematch_recipe_by_id``).
+            Raises RecipeNotFoundError when the recipe is missing.
+        """
+        result = await self._rematch_recipe_by_id(recipe_id, relaxed=relaxed)
+        recipe_name = (result.get("recipe") or {}).get("name") or recipe_id
+        logger.info(
+            "Recipe rematch %s (%s): success=%s, %d entries matched, %d unresolved, %d errors",
+            recipe_id,
+            recipe_name,
+            result.get("success"),
+            result.get("matched_entries", 0),
+            result.get("unresolved_entries", 0),
+            result.get("errors", 0),
+        )
+        return result
+
+    async def _rematch_recipe_by_id(
+        self, recipe_id: str, *, relaxed: bool = False
+    ) -> Dict[str, Any]:
+        """Rematch a single recipe's deleted lora/checkpoint entries locally.
+
+        Match snapshots (local hash cache, computed autov3 cache, filename
+        cache) are built BEFORE acquiring the mutation lock — all three are
+        read-only snapshots and the version-cached dicts would otherwise
+        rebuild mid-run if a scan bumps a scanner's cache_version while we
+        hold the lock.
+
+        Args:
+            recipe_id: ID of the recipe to rematch
+            relaxed: When True, healthy entries are rematch candidates too
+                (see ``_rematch_single_recipe``).
+
+        Returns:
+            Dict summary of the rematch result with unified counters
+            (matched_recipes, matched_entries, unresolved_recipes,
+            unresolved_entries plus the legacy rematched/skipped/errors
+            fields) and a per-entry ``details`` report plus a flattened
+            ``l4_matches`` list (filename-level matches for review/undo,
+            consistent with the bulk/global paths). The legacy ``skipped``
+            field means "recipe not updated" and overlaps
+            ``unresolved_recipes`` (a recipe with unmatched candidates counts
+            as both). Raises RecipeNotFoundError when the recipe is missing.
+        """
+        local_cache = await self.build_local_hash_cache()
+        autov3_cache = await self._build_rematch_autov3_cache()
+        filename_cache = await self._build_local_filename_cache()
+
+        async with self._mutation_lock:
+            # Get raw recipe from cache directly to avoid formatted fields
+            cache = await self.get_cached_data()
+            recipe = next(
+                (r for r in cache.raw_data if str(r.get("id", "")) == recipe_id), None
+            )
+
+            if not recipe:
+                raise RecipeNotFoundError(f"Recipe {recipe_id} not found")
+
+            try:
+                rematched, _errors, details = await self._rematch_single_recipe(
+                    recipe, local_cache, autov3_cache, filename_cache,
+                    relaxed=relaxed,
+                )
+            except RecipePersistenceError as exc:
+                logger.error(
+                    "Recipe rematch %s (%s) failed to persist: %s",
+                    recipe_id,
+                    recipe.get("name") or recipe.get("file_path"),
+                    exc,
+                )
+                return {
+                    "success": False,
+                    "errors": 1,
+                    "rematched": 0,
+                    "skipped": 0,
+                    "matched_recipes": 0,
+                    "matched_entries": 0,
+                    "unresolved_recipes": 0,
+                    "unresolved_entries": 0,
+                    "details": {"matched": [], "unresolved": []},
+                    "l4_matches": [],
+                    "recipe": recipe,
+                    "error": str(exc),
+                }
+
+            unresolved_entries = len(details["unresolved"])
+            unresolved_recipes = 1 if unresolved_entries > 0 else 0
+            # Flattened L4 matches for the results modal, consistent with
+            # the bulk/global paths.
+            l4_matches = self._collect_l4_matches(recipe_id, details)
+
+            if rematched == 0:
+                return {
+                    "success": True,
+                    "rematched": 0,
+                    "skipped": 1,
+                    "matched_recipes": 0,
+                    "matched_entries": 0,
+                    "unresolved_recipes": unresolved_recipes,
+                    "unresolved_entries": unresolved_entries,
+                    "details": details,
+                    "l4_matches": l4_matches,
+                    "recipe": recipe,
+                }
+
+            # Enriched re-fetch so the frontend receives file_url/preview fields.
+            return {
+                "success": True,
+                "rematched": rematched,
+                "skipped": 0,
+                "matched_recipes": 1,
+                "matched_entries": rematched,
+                "unresolved_recipes": unresolved_recipes,
+                "unresolved_entries": unresolved_entries,
+                "details": details,
+                "l4_matches": l4_matches,
+                "recipe": await self.get_recipe_by_id(recipe_id),
+            }
+
+    async def _rematch_single_recipe(
+        self,
+        recipe: Dict[str, Any],
+        local_cache: dict[str, dict[str, Any]],
+        autov3_cache: dict[str, dict[str, Any]],
+        filename_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
+        *,
+        relaxed: bool = False,
+    ) -> Tuple[int, int, Dict[str, Any]]:
+        """Rematch a single recipe's lora/checkpoint entries against local models.
+
+        Shared per-recipe helper used by ``rematch_recipe_by_id`` and the bulk
+        rematch entry points. Mutates the recipe dict in place, recomputes the
+        fingerprint and persists via ``_save_recipe_persistently`` when any
+        entry changed. ``_schedule_resort`` is deliberately NOT called here —
+        it is hoisted to the public entry points.
+
+        Args:
+            recipe: The recipe dictionary to rematch (modified in-place)
+            local_cache: L1 hash cache snapshot (build_local_hash_cache)
+            autov3_cache: L3 computed-autov3 cache snapshot
+            filename_cache: L4 filename cache snapshot, or None to disable
+                the filename fallback
+            relaxed: When True, healthy entries ("Not in Library") are also
+                rematch candidates. Anti-churn rule: an entry that is a
+                candidate ONLY because of relaxed mode is skipped when its
+                hash already resolves in the L1 ``local_cache`` — it is
+                already correctly linked and rematching would only add noise
+                and a pointless snapshot.
+
+        Returns:
+            Tuple of (rematched_entries, errors, details). The errors element
+            is always 0 on a normal return — a persistence failure RAISES
+            ``RecipePersistenceError`` so callers can count it. ``details``
+            carries the per-entry outcome:
+            ``{"matched": [{type, entry, file_name, match_level, lora_index?}],
+              "unresolved": [{type, entry}]}`` where an unresolved entry is a
+            rematch candidate that found no local match — an expected outcome
+            (the model may simply not exist locally), not an error.
+            ``lora_index`` is only present for lora entries (the checkpoint
+            restore endpoint needs no index).
+
+        Raises:
+            RecipePersistenceError: when the recipe changed but
+                ``_save_recipe_persistently`` returned False.
+        """
+        rematched = 0
+        details: Dict[str, Any] = {"matched": [], "unresolved": []}
+
+        def is_actionable_candidate(entry: Dict[str, Any]) -> bool:
+            """Apply candidacy plus the relaxed-mode anti-churn rule."""
+            if self._is_rematch_candidate(entry):
+                return True
+            if not relaxed or not self._is_rematch_candidate(entry, relaxed=True):
+                return False
+            # Relaxed-only candidate: skip when the stored hash already
+            # resolves in the L1 local cache — the entry is already correctly
+            # linked and rematching would just add noise and a snapshot.
+            entry_hash = (entry.get("hash") or "").lower()
+            return local_cache.get(entry_hash) is None
+
+        # Lora entries
+        loras = recipe.get("loras", [])
+        if isinstance(loras, list):
+            for lora_index, entry in enumerate(loras):
+                if not is_actionable_candidate(entry):
+                    continue
+                item, level = await self._match_rematch_entry_with_level(
+                    entry,
+                    local_cache,
+                    autov3_cache,
+                    is_checkpoint=False,
+                    filename_cache=filename_cache,
+                    recipe_base_model=entry.get("baseModel")
+                    or recipe.get("base_model"),
+                )
+                if item is None:
+                    details["unresolved"].append(
+                        {"type": "lora", "entry": self._entry_identifier(entry)}
+                    )
+                    continue
+                # Capture the identifier before the write-back mutates the
+                # entry (file_name/isDeleted are rewritten in place).
+                details["matched"].append(
+                    {
+                        "type": "lora",
+                        "entry": self._entry_identifier(entry),
+                        "file_name": item.get("file_name") or "",
+                        "match_level": level,
+                        "lora_index": lora_index,
+                    }
+                )
+                self._write_rematch_lora_entry(entry, item)
+                rematched += 1
+
+        # Checkpoint entry (dict only — legacy string checkpoints are skipped
+        # silently since ``entry.get`` on a str would raise AttributeError).
+        checkpoint = recipe.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            if is_actionable_candidate(checkpoint):
+                item, level = await self._match_rematch_entry_with_level(
+                    checkpoint,
+                    local_cache,
+                    autov3_cache,
+                    is_checkpoint=True,
+                    filename_cache=filename_cache,
+                    recipe_base_model=checkpoint.get("baseModel")
+                    or recipe.get("base_model"),
+                )
+                if item is None:
+                    details["unresolved"].append(
+                        {
+                            "type": "checkpoint",
+                            "entry": self._entry_identifier(checkpoint),
+                        }
+                    )
+                else:
+                    details["matched"].append(
+                        {
+                            "type": "checkpoint",
+                            "entry": self._entry_identifier(checkpoint),
+                            "file_name": item.get("file_name") or "",
+                            "match_level": level,
+                        }
+                    )
+                    self._write_rematch_checkpoint_entry(checkpoint, item)
+                    rematched += 1
+
+        # Per-recipe detail is DEBUG only: one INFO line per recipe would
+        # flood the log for large libraries, and unresolved entries are a
+        # normal outcome rather than something to warn about.
+        if details["matched"] or details["unresolved"]:
+            matched_desc = ", ".join(
+                f"{m['entry']} -> {m['file_name']} ({m['match_level']})"
+                for m in details["matched"]
+            ) or "-"
+            unresolved_desc = ", ".join(
+                u["entry"] for u in details["unresolved"]
+            ) or "-"
+            logger.debug(
+                "Recipe rematch %s: matched %d entries [%s]; unresolved %d [%s]",
+                recipe.get("id") or recipe.get("file_path"),
+                len(details["matched"]),
+                matched_desc,
+                len(details["unresolved"]),
+                unresolved_desc,
+            )
+
+        if rematched == 0:
+            return (0, 0, details)
+
+        from ..utils.utils import calculate_recipe_fingerprint
+
+        recipe["fingerprint"] = calculate_recipe_fingerprint(recipe.get("loras", []))
+
+        saved = await self._save_recipe_persistently(recipe)
+        if not saved:
+            raise RecipePersistenceError(
+                f"Failed to persist recipe {recipe.get('id')} after rematch"
+            )
+
+        self._update_fts_index_for_recipe(recipe, "update")
+        return (rematched, 0, details)
+
+    @staticmethod
+    def _collect_l4_matches(
+        recipe_id: Any, details: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Flatten a recipe's L4 (filename-level) matches for review.
+
+        Returns ``[{recipe_id, type, entry, file_name, lora_index?}]`` rows —
+        one per matched detail at level L4. ``lora_index`` is only present
+        for lora entries (checkpoint restore needs no index).
+        """
+        rows: List[Dict[str, Any]] = []
+        for match in details.get("matched", []):
+            if match.get("match_level") != "L4":
+                continue
+            row: Dict[str, Any] = {
+                "recipe_id": recipe_id,
+                "type": match.get("type"),
+                "entry": match.get("entry"),
+                "file_name": match.get("file_name"),
+            }
+            if "lora_index" in match:
+                row["lora_index"] = match["lora_index"]
+            rows.append(row)
+        return rows
+
+    async def rematch_all_recipes(
+        self,
+        progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        *,
+        relaxed: bool = False,
+    ) -> Dict[str, Any]:
+        """Rematch every recipe's deleted lora/checkpoint entries locally.
+
+        Match snapshots (local hash cache, computed autov3 cache, filename
+        cache) are built ONCE before the loop — all three are read-only and
+        the version-cached dicts would otherwise rebuild mid-run if a scan
+        bumps a scanner's cache_version while the mutation lock is held.
+        ``_schedule_resort`` is called exactly once after the loop: it spawns
+        an asyncio task per call, so per-recipe calls would race one resort
+        task per recipe.
+
+        Args:
+            progress_callback: Optional callback for progress updates
+                (started/processing/cancelled/completed events). The
+                completed/cancelled payloads carry ``l4_matches``, a
+                flattened list of filename-level matches for review/undo.
+            relaxed: When True, healthy entries are rematch candidates too
+                (see ``_rematch_single_recipe``).
+
+        Returns:
+            Dict summary of the rematch run with unified counters
+            (matched_recipes/matched_entries/unresolved_recipes/unresolved_
+            entries plus the legacy success/status/rematched/skipped/errors/
+            total fields) and ``l4_matches``. ``rematched`` (legacy) counts
+            updated recipes — use ``matched_entries`` for the entry-level
+            total.
+        """
+        start_time = time.perf_counter()
+
+        if progress_callback:
+            await progress_callback({"status": "started"})
+
+        # Match snapshots built once and shared by every recipe in the loop.
+        local_cache = await self.build_local_hash_cache()
+        autov3_cache = await self._build_rematch_autov3_cache()
+        filename_cache = await self._build_local_filename_cache()
+
+        async with self._mutation_lock:
+            cache = await self.get_cached_data()
+            all_recipes = list(cache.raw_data)
+            total = len(all_recipes)
+            matched_recipes = 0
+            matched_entries = 0
+            unresolved_recipes = 0
+            unresolved_entries = 0
+            skipped_count = 0
+            errors_count = 0
+            l4_matches: List[Dict[str, Any]] = []
+
+            for i, recipe in enumerate(all_recipes):
+                if self.is_cancelled():
+                    logger.info(
+                        "Recipe rematch cancelled by user after %d/%d recipes: "
+                        "%d updated (%d entries matched), %d unresolved entries "
+                        "in %d recipes, %d errors",
+                        i,
+                        total,
+                        matched_recipes,
+                        matched_entries,
+                        unresolved_entries,
+                        unresolved_recipes,
+                        errors_count,
+                    )
+                    if progress_callback:
+                        await progress_callback(
+                            {
+                                "status": "cancelled",
+                                "current": i,
+                                "total": total,
+                                "rematched": matched_recipes,
+                                "skipped": skipped_count,
+                                "errors": errors_count,
+                                "matched_recipes": matched_recipes,
+                                "matched_entries": matched_entries,
+                                "unresolved_recipes": unresolved_recipes,
+                                "unresolved_entries": unresolved_entries,
+                                "l4_matches": l4_matches,
+                            }
+                        )
+                    return {
+                        "success": False,
+                        "status": "cancelled",
+                        "rematched": matched_recipes,
+                        "skipped": skipped_count,
+                        "errors": errors_count,
+                        "total": total,
+                        "matched_recipes": matched_recipes,
+                        "matched_entries": matched_entries,
+                        "unresolved_recipes": unresolved_recipes,
+                        "unresolved_entries": unresolved_entries,
+                        "l4_matches": l4_matches,
+                    }
+
+                try:
+                    # Report progress
+                    if progress_callback:
+                        await progress_callback(
+                            {
+                                "status": "processing",
+                                "current": i + 1,
+                                "total": total,
+                                "recipe_name": recipe.get("name", "Unknown"),
+                            }
+                        )
+
+                    rematched, _errors, details = await self._rematch_single_recipe(
+                        recipe, local_cache, autov3_cache, filename_cache,
+                        relaxed=relaxed,
+                    )
+                    if rematched > 0:
+                        matched_recipes += 1
+                        matched_entries += rematched
+                        l4_matches.extend(
+                            self._collect_l4_matches(recipe.get("id"), details)
+                        )
+                    else:
+                        skipped_count += 1
+
+                    recipe_unresolved = len(details["unresolved"])
+                    if recipe_unresolved > 0:
+                        unresolved_recipes += 1
+                        unresolved_entries += recipe_unresolved
+
+                except Exception as exc:
+                    logger.error(
+                        f"Error rematching recipe {recipe.get('file_path')}: {exc}"
+                    )
+                    errors_count += 1
+
+            # Hoisted to one call — _schedule_resort spawns an asyncio task
+            # per call, so per-recipe calls would race 5k resort tasks.
+            self._schedule_resort()
+
+            logger.info(
+                "Recipe rematch complete: %d/%d recipes updated (%d entries "
+                "matched), %d unresolved entries in %d recipes, %d skipped, "
+                "%d errors in %.2fs",
+                matched_recipes,
+                total,
+                matched_entries,
+                unresolved_entries,
+                unresolved_recipes,
+                skipped_count,
+                errors_count,
+                time.perf_counter() - start_time,
+            )
+
+            # Final progress update
+            if progress_callback:
+                await progress_callback(
+                    {
+                        "status": "completed",
+                        "rematched": matched_recipes,
+                        "skipped": skipped_count,
+                        "errors": errors_count,
+                        "total": total,
+                        "matched_recipes": matched_recipes,
+                        "matched_entries": matched_entries,
+                        "unresolved_recipes": unresolved_recipes,
+                        "unresolved_entries": unresolved_entries,
+                        "l4_matches": l4_matches,
+                    }
+                )
+
+            return {
+                "success": True,
+                "rematched": matched_recipes,
+                "skipped": skipped_count,
+                "errors": errors_count,
+                "total": total,
+                "matched_recipes": matched_recipes,
+                "matched_entries": matched_entries,
+                "unresolved_recipes": unresolved_recipes,
+                "unresolved_entries": unresolved_entries,
+                "l4_matches": l4_matches,
+            }
+
+    async def rematch_recipes_bulk(
+        self, recipe_ids: List[str], *, relaxed: bool = False
+    ) -> Dict[str, Any]:
+        """Rematch a set of recipes by their IDs.
+
+        Iterates ``_rematch_recipe_by_id`` over each id: not-found ids are
+        counted as skipped, and unexpected per-recipe exceptions are counted as
+        errors with the loop continuing so partial results are never lost.
+        Persist failures are already converted to the by_id return shape and
+        are counted via its ``errors`` field only — never double-counted here.
+
+        Args:
+            recipe_ids: List of recipe ids to rematch.
+            relaxed: When True, healthy entries are rematch candidates too
+                (see ``_rematch_single_recipe``).
+
+        Returns:
+            Dict summary of the bulk run with unified counters
+            (matched_recipes, matched_entries, unresolved_recipes,
+            unresolved_entries plus the legacy total/rematched/skipped/errors
+            fields), a per-recipe ``details`` list, and ``l4_matches`` — a
+            flattened list of filename-level matches for review/undo. The
+            legacy ``rematched`` field is the total entry count (same as
+            ``matched_entries``) — unlike ``rematch_all_recipes`` where it
+            counts updated recipes.
+        """
+        total = len(recipe_ids)
+        matched_recipes = 0
+        matched_entries = 0
+        unresolved_recipes = 0
+        unresolved_entries = 0
+        skipped = 0
+        errors = 0
+        recipes: List[Dict[str, Any]] = []
+        details_list: List[Dict[str, Any]] = []
+        l4_matches: List[Dict[str, Any]] = []
+
+        for recipe_id in recipe_ids:
+            try:
+                result = await self._rematch_recipe_by_id(
+                    recipe_id, relaxed=relaxed
+                )
+                if result.get("success"):
+                    matched_recipes += result.get("matched_recipes", 0)
+                    matched_entries += result.get("matched_entries", 0)
+                    unresolved_recipes += result.get("unresolved_recipes", 0)
+                    unresolved_entries += result.get("unresolved_entries", 0)
+                    skipped += result.get("skipped", 0)
+                    if result.get("recipe"):
+                        recipes.append(result["recipe"])
+                    if result.get("details"):
+                        details_list.append(
+                            {"recipe_id": recipe_id, **result["details"]}
+                        )
+                        l4_matches.extend(
+                            self._collect_l4_matches(recipe_id, result["details"])
+                        )
+                else:
+                    errors += result.get("errors", 0)
+            except RecipeNotFoundError:
+                skipped += 1
+            except Exception as exc:
+                logger.error(f"Error rematching recipe {recipe_id}: {exc}")
+                errors += 1
+
+        self._schedule_resort()
+
+        logger.info(
+            "Recipe bulk rematch: %d/%d recipes updated (%d entries matched), "
+            "%d unresolved entries in %d recipes, %d skipped, %d errors",
+            matched_recipes,
+            total,
+            matched_entries,
+            unresolved_entries,
+            unresolved_recipes,
+            skipped,
+            errors,
+        )
+
+        return {
+            "success": True,
+            "total": total,
+            "rematched": matched_entries,
+            "skipped": skipped,
+            "errors": errors,
+            "matched_recipes": matched_recipes,
+            "matched_entries": matched_entries,
+            "unresolved_recipes": unresolved_recipes,
+            "unresolved_entries": unresolved_entries,
+            "recipes": recipes,
+            "details": details_list,
+            "l4_matches": l4_matches,
+        }
+
+    def _write_rematch_lora_entry(
+        self, entry: Dict[str, Any], item: Dict[str, Any]
+    ) -> None:
+        """Write back a matched local model to a lora recipe entry."""
+        # Snapshot the pre-rematch state so the association can be restored
+        # later (undo), mirroring the manual reconnect flow in
+        # ``update_lora_entry``. Never nest snapshots.
+        snapshot = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key != "reconnectSnapshot"
+        }
+
+        entry["isDeleted"] = False
+        entry["hashInvalid"] = False
+
+        # Only truthy hashes are written — pending/failed items carry an empty
+        # sha256 and an unconditional write would wipe a valid stored hash.
+        new_hash = (item.get("sha256") or "").lower()
+        if new_hash:
+            entry["hash"] = new_hash
+
+        if item.get("file_name"):
+            entry["file_name"] = item["file_name"]
+
+        civitai = item.get("civitai")
+        if isinstance(civitai, dict):
+            if civitai.get("id") is not None:
+                entry["modelVersionId"] = civitai["id"]
+            # modelName comes from the item, NOT civitai.model.name — the slim
+            # civitai payload drops model.name entirely.
+            if item.get("model_name"):
+                entry["modelName"] = item["model_name"]
+            if civitai.get("name"):
+                entry["modelVersionName"] = civitai["name"]
+
+        entry["reconnectSnapshot"] = snapshot
+
+    def _write_rematch_checkpoint_entry(
+        self, entry: Dict[str, Any], item: Dict[str, Any]
+    ) -> None:
+        """Write back a matched local model to a checkpoint recipe entry.
+
+        Follows the pinned stored key set: parser-style entries carry
+        name/version/id/type/baseModel/file_name/hash; widget-style entries
+        additionally carry modelName/modelVersionName. Keys are only updated
+        when they already exist on the entry (or written fresh for the
+        identifier key when neither identifier form exists).
+        """
+        # Snapshot the pre-rematch state so the association can be restored
+        # later (undo), mirroring the manual reconnect flow. Never nest
+        # snapshots.
+        snapshot = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key != "reconnectSnapshot"
+        }
+
+        entry["isDeleted"] = False
+        entry["hashInvalid"] = False
+
+        new_hash = (item.get("sha256") or "").lower()
+        if new_hash:
+            entry["hash"] = new_hash
+
+        if item.get("file_name"):
+            entry["file_name"] = item["file_name"]
+
+        civitai = item.get("civitai")
+        civ_name = civitai.get("name") if isinstance(civitai, dict) else None
+        civ_id = civitai.get("id") if isinstance(civitai, dict) else None
+        item_name = item.get("model_name")
+        item_base_model = item.get("base_model")
+
+        # Backfill name/version/baseModel only when the entry already has them.
+        if "name" in entry and item_name:
+            entry["name"] = item_name
+        if "version" in entry and civ_name:
+            entry["version"] = civ_name
+        if "baseModel" in entry and item_base_model:
+            entry["baseModel"] = item_base_model
+
+        # Widget-style entries (modelName/modelVersionName) get stale values
+        # refreshed; parser-style entries never gain them.
+        if "modelName" in entry and item_name:
+            entry["modelName"] = item_name
+        if "modelVersionName" in entry and civ_name:
+            entry["modelVersionName"] = civ_name
+
+        # Identifier key updated per the entry's existing convention.
+        if civ_id is not None:
+            if "modelVersionId" in entry:
+                entry["modelVersionId"] = civ_id
+            elif "id" in entry:
+                entry["id"] = civ_id
+            else:
+                entry["modelVersionId"] = civ_id
+
+        entry["reconnectSnapshot"] = snapshot
+
+    async def _save_recipe_persistently(self, recipe: Dict[str, Any]) -> bool:
+        """Helper to save a recipe to both JSON and EXIF metadata."""
+        recipe_id = recipe.get("id")
+        if not recipe_id:
+            return False
+
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path:
+            return False
+
+        try:
+            # 1. Sanitize for storage (remove runtime convenience fields)
+            clean_recipe = self._sanitize_recipe_for_storage(recipe)
+
+            # 2. Update the original dictionary so that we persist the clean version
+            # globally if needed, effectively overwriting it in-place.
+            recipe.clear()
+            recipe.update(clean_recipe)
+
+            # 3. Save JSON
+            with open(recipe_json_path, "w", encoding="utf-8") as f:
+                json.dump(recipe, f, indent=4, ensure_ascii=False)
+
+            # 4. Update persistent SQLite cache
+            if self._persistent_cache:
+                self._persistent_cache.update_recipe(recipe, recipe_json_path)
+                self._json_path_map[str(recipe_id)] = recipe_json_path
+
+            # 5. Update EXIF if image exists
+            image_path = recipe.get("file_path")
+            if image_path and os.path.exists(image_path):
+                from ..utils.exif_utils import ExifUtils
+
+                ExifUtils.append_recipe_metadata(image_path, recipe)
+
+            return True
+        except Exception as e:
+            logger.error(f"Error persisting recipe {recipe_id}: {e}")
+            return False
+
+    def _sanitize_recipe_for_storage(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a clean copy of the recipe without runtime convenience fields."""
+        import copy
+
+        clean = copy.deepcopy(recipe)
+
+        # 0. Clean top-level runtime fields
+        for key in ("file_url", "created_date_formatted", "modified_formatted"):
+            clean.pop(key, None)
+
+        # 1. Clean LORAs
+        if "loras" in clean and isinstance(clean["loras"], list):
+            for lora in clean["loras"]:
+                # Fields to remove (runtime only)
+                for key in ("inLibrary", "preview_url", "localPath"):
+                    lora.pop(key, None)
+
+                # Normalize weight/strength if mapping is desired (standard in persistence_service)
+                if "weight" in lora and "strength" not in lora:
+                    lora["strength"] = float(lora.pop("weight"))
+
+        # 2. Clean Checkpoint
+        if "checkpoint" in clean and isinstance(clean["checkpoint"], dict):
+            cp = clean["checkpoint"]
+            # Fields to remove (runtime only)
+            for key in (
+                "inLibrary",
+                "localPath",
+                "preview_url",
+                "thumbnailUrl",
+                "size",
+                "downloadUrl",
+            ):
+                cp.pop(key, None)
+
+        return clean
+
+    async def initialize_in_background(self) -> None:
+        """Initialize cache in background using thread pool"""
+        # Mark as initializing before any await so concurrent callers can
+        # wait on this task instead of observing the placeholder empty cache
+        # (the LoRA scanner wait below can take a while at startup).
+        self._is_initializing = True
+        self._initialization_task = asyncio.current_task()
+        try:
+            await ws_manager.broadcast_init_progress({
+                'stage': 'loading_cache',
+                'progress': 0,
+                'details': 'Loading recipe cache...',
+                'scanner_type': 'recipe',
+                'pageType': 'recipes',
+            })
+
+            await self._wait_for_lora_scanner()
+
+            # Set initial empty cache to avoid None reference errors
+            if self._cache is None:
+                self._cache = RecipeCache(
+                    raw_data=[],
+                    sorted_by_name=[],
+                    sorted_by_date=[],
+                    folders=[],
+                    folder_tree={},
+                )
+
+            # Start timer
+            start_time = time.time()
+
+            # Use thread pool to execute CPU-intensive operations
+            loop = asyncio.get_event_loop()
+            cache = await loop.run_in_executor(
+                None,  # Use default thread pool
+                self._initialize_recipe_cache_sync,  # Run synchronous version in thread
+            )
+            if cache is not None:
+                self._cache = cache
+
+            # Calculate elapsed time and log it
+            elapsed_time = time.time() - start_time
+            recipe_count = (
+                len(cache.raw_data) if cache and hasattr(cache, "raw_data") else 0
+            )
+            logger.info(
+                f"Recipe cache initialized in {elapsed_time:.2f} seconds. Found {recipe_count} recipes"
+            )
+            await ws_manager.broadcast_init_progress({
+                'stage': 'finalizing',
+                'progress': 100,
+                'status': 'complete',
+                'details': f'Found {recipe_count} recipes.',
+                'scanner_type': 'recipe',
+                'pageType': 'recipes',
+            })
+            self._schedule_post_scan_enrichment()
+            # Schedule FTS index build in background (non-blocking)
+            self._schedule_fts_index_build()
+        except Exception as e:
+            logger.error(f"Recipe Scanner: Error initializing cache in background: {e}")
+            # Ensure the cache is never None so the page stops showing the
+            # initialization screen, and let waiting clients reload into the
+            # regular (possibly empty) view instead of stalling.
+            if self._cache is None:
+                self._cache = RecipeCache(
+                    raw_data=[],
+                    sorted_by_name=[],
+                    sorted_by_date=[],
+                    folders=[],
+                    folder_tree={},
+                )
+            await ws_manager.broadcast_init_progress({
+                'stage': 'finalizing',
+                'progress': 100,
+                'status': 'complete',
+                'details': 'Recipe cache initialization failed.',
+                'scanner_type': 'recipe',
+                'pageType': 'recipes',
+            })
+        finally:
+            # Mark initialization as complete regardless of outcome
+            self._is_initializing = False
+
+    async def _broadcast_scan_progress(
+        self,
+        status: str,
+        stage: str,
+        progress: int,
+        full_rebuild: bool,
+        **extra: Any,
+    ) -> None:
+        """Broadcast manual-refresh scan progress on the generic WS channel.
+
+        Mirrors ``ModelScanner._broadcast_scan_progress`` so the recipes page
+        can reuse the same frontend contract. Best-effort only: broadcast
+        failures must never affect the scan itself.
+        """
+        payload: Dict[str, Any] = {
+            'type': 'scan_progress',
+            'status': status,
+            'model_type': 'recipe',
+            'pageType': 'recipes',
+            'stage': stage,
+            'full_rebuild': full_rebuild,
+            'progress': progress,
+        }
+        payload.update(extra)
+        try:
+            await ws_manager.broadcast(payload)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(f"Error broadcasting scan progress for recipe: {exc}")
+
+    def _initialize_recipe_cache_sync(self, report_progress: bool = False):
+        """Synchronous version of recipe cache initialization for thread pool execution.
+
+        Uses persistent cache for fast startup when available:
+        1. Try to load from persistent SQLite cache
+        2. Reconcile with filesystem (check mtime/size for changes)
+        3. Fall back to full directory scan if cache miss or reconciliation fails
+        4. Persist results for next startup
+
+        Args:
+            report_progress: When True (manual force-refresh only), broadcast
+                scan_progress messages during the full directory scan. Startup
+                initialization leaves this False and behaves as before.
+        """
+        loop = None
+        scan_start_time: Optional[float] = None
+        try:
+            # Ensure cache exists to avoid None reference errors
+            if self._cache is None:
+                self._cache = RecipeCache(
+                    raw_data=[],
+                    sorted_by_name=[],
+                    sorted_by_date=[],
+                    folders=[],
+                    folder_tree={},
+                )
+
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # Initialize persistent cache
+            if self._persistent_cache is None:
+                from .persistent_recipe_cache import get_persistent_recipe_cache
+
+                self._persistent_cache = get_persistent_recipe_cache()
+
+            recipes_dir = self.recipes_dir
+            if not recipes_dir or not os.path.exists(recipes_dir):
+                logger.warning(f"Recipes directory not found: {recipes_dir}")
+                return self._cache
+
+            # Try to load from persistent cache first
+            persisted = self._persistent_cache.load_cache()
+            if persisted:
+                recipes, changed, json_paths = self._reconcile_recipe_cache(
+                    persisted, recipes_dir
+                )
+                self._json_path_map = json_paths
+
+                if not changed:
+                    # Fast path: use cached data directly
+                    logger.info(
+                        "Recipe cache hit: loaded %d recipes from persistent cache",
+                        len(recipes),
+                    )
+                    self._cache.raw_data = recipes
+                    self._update_folder_metadata(self._cache)
+                    self._sort_cache_sync()
+                    # Backfill source_path from JSON files if missing (one-shot schema migration)
+                    if self._backfill_source_path_if_needed(recipes, json_paths):
+                        self._cache.image_id_map = self._build_image_id_map()
+                        self._persistent_cache.save_cache(
+                            recipes, json_paths, self._cache.image_id_map
+                        )
+                    else:
+                        # Use persisted map, or rebuild if empty (e.g. first startup
+                        # after deploying the image_id_map feature).
+                        if persisted.image_id_map:
+                            self._cache.image_id_map = dict(persisted.image_id_map)
+                        else:
+                            self._cache.image_id_map = self._build_image_id_map()
+                            if self._cache.image_id_map:
+                                self._persistent_cache.save_image_id_map(
+                                    self._cache.image_id_map
+                                )
+                    return self._cache
+                else:
+                    # Partial update: some files changed
+                    logger.info(
+                        "Recipe cache partial hit: reconciled %d recipes with filesystem",
+                        len(recipes),
+                    )
+                    self._cache.raw_data = recipes
+                    self._update_folder_metadata(self._cache)
+                    self._sort_cache_sync()
+                    # Backfill source_path from JSON files if missing (one-shot schema migration)
+                    self._backfill_source_path_if_needed(recipes, json_paths)
+                    self._cache.image_id_map = self._build_image_id_map()
+                    # Persist updated cache
+                    self._persistent_cache.save_cache(
+                        recipes, json_paths, self._cache.image_id_map
+                    )
+                    return self._cache
+
+            # Fall back to full directory scan
+            logger.info("Recipe cache miss: performing full directory scan")
+            if report_progress:
+                scan_start_time = time.time()
+                # Broadcast from the worker thread via its own event loop,
+                # mirroring ModelScanner._initialize_cache_sync.
+                loop.run_until_complete(
+                    self._broadcast_scan_progress('started', 'scan_folders', 0, True)
+                )
+            recipes, json_paths = self._full_directory_scan_sync(
+                recipes_dir,
+                progress_loop=loop if report_progress else None,
+            )
+            self._json_path_map = json_paths
+
+            # Update cache with the collected data
+            self._cache.raw_data = recipes
+            self._update_folder_metadata(self._cache)
+            self._sort_cache_sync()
+            self._cache.image_id_map = self._build_image_id_map()
+
+            # Persist for next startup
+            self._persistent_cache.save_cache(
+                recipes, json_paths, self._cache.image_id_map
+            )
+
+            if report_progress:
+                loop.run_until_complete(
+                    self._broadcast_scan_progress(
+                        'completed', 'finalizing', 100, True,
+                        elapsed_seconds=time.time() - (scan_start_time or time.time()),
+                        total=len(recipes),
+                    )
+                )
+
+            return self._cache
+        except Exception as e:
+            logger.error(f"Error in thread-based recipe cache initialization: {e}")
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            if report_progress and loop is not None:
+                try:
+                    loop.run_until_complete(
+                        self._broadcast_scan_progress(
+                            'error', 'process_models', 0, True, error=str(e)
+                        )
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.error("Error broadcasting recipe scan failure", exc_info=True)
+            return self._cache if hasattr(self, "_cache") else None
+        finally:
+            # Clean up the event loop
+            if loop is not None:
+                loop.close()
+
+    def _reconcile_recipe_cache(
+        self,
+        persisted: PersistedRecipeData,
+        recipes_dir: str,
+    ) -> Tuple[List[Dict[str, Any]], bool, Dict[str, str]]:
+        """Reconcile persisted cache with current filesystem state.
+
+        Args:
+            persisted: The persisted recipe data from SQLite cache.
+            recipes_dir: Path to the recipes directory.
+
+        Returns:
+            Tuple of (recipes list, changed flag, json_paths dict).
+        """
+        recipes: List[Dict[str, Any]] = []
+        json_paths: Dict[str, str] = {}
+        changed = False
+
+        # Build set of current recipe files
+        current_files: Dict[str, Tuple[float, int]] = {}
+        for root, _, files in os.walk(recipes_dir):
+            for file in files:
+                if file.lower().endswith(".recipe.json"):
+                    file_path = os.path.join(root, file)
+                    try:
+                        stat = os.stat(file_path)
+                        current_files[file_path] = (stat.st_mtime, stat.st_size)
+                    except OSError:
+                        continue
+
+        # Build recipe_id -> recipe lookup (O(n) instead of O(n²))
+        recipe_by_id: Dict[str, Dict[str, Any]] = {
+            str(r.get("id", "")): r for r in persisted.raw_data if r.get("id")
+        }
+
+        # Build json_path -> recipe lookup from file_stats (O(m))
+        persisted_by_path: Dict[str, Dict[str, Any]] = {}
+        for json_path in persisted.file_stats.keys():
+            basename = os.path.basename(json_path)
+            if basename.lower().endswith(".recipe.json"):
+                recipe_id = basename[: -len(".recipe.json")]
+                if recipe_id in recipe_by_id:
+                    persisted_by_path[json_path] = recipe_by_id[recipe_id]
+
+        # Process current files
+        for file_idx, (file_path, (current_mtime, current_size)) in enumerate(
+            current_files.items()
+        ):
+            cached_stats = persisted.file_stats.get(file_path)
+
+            # Extract recipe_id from current file for fallback lookup
+            basename = os.path.basename(file_path)
+            recipe_id_from_file = (
+                basename[: -len(".recipe.json")]
+                if basename.lower().endswith(".recipe.json")
+                else None
+            )
+
+            if cached_stats:
+                cached_mtime, cached_size = cached_stats
+                # Check if file is unchanged
+                if (
+                    abs(current_mtime - cached_mtime) < 1.0
+                    and current_size == cached_size
+                ):
+                    # Try direct path lookup first
+                    cached_recipe = persisted_by_path.get(file_path)
+                    # Fallback to recipe_id lookup if path lookup fails
+                    if not cached_recipe and recipe_id_from_file:
+                        cached_recipe = recipe_by_id.get(recipe_id_from_file)
+                    if cached_recipe:
+                        recipe_id = str(cached_recipe.get("id", ""))
+                        # Track folder from file path
+                        cached_recipe["folder"] = cached_recipe.get(
+                            "folder"
+                        ) or self._calculate_folder(file_path)
+                        recipes.append(cached_recipe)
+                        json_paths[recipe_id] = file_path
+                        continue
+
+            # File is new or changed - need to re-read
+            changed = True
+            recipe_data = self._load_recipe_file_sync(file_path)
+            if recipe_data:
+                recipe_id = str(recipe_data.get("id", ""))
+                recipes.append(recipe_data)
+                json_paths[recipe_id] = file_path
+
+            # Periodically release GIL so the event loop thread can run
+            if file_idx % 100 == 0:
+                time.sleep(0)
+
+        # Check for deleted files
+        for json_path in persisted.file_stats.keys():
+            if json_path not in current_files:
+                changed = True
+                logger.debug("Recipe file deleted: %s", json_path)
+
+        return recipes, changed, json_paths
+
+    # Metadata key recording that the one-shot source_path backfill has run.
+    _SOURCE_PATH_BACKFILL_MARKER = "source_path_backfilled"
+
+    def _backfill_source_path_if_needed(
+        self,
+        recipes: List[Dict[str, Any]],
+        json_paths: Dict[str, str],
+    ) -> bool:
+        """Backfill source_path from recipe JSON files if missing from cache.
+
+        This is a one-shot schema migration: once it has run, a completion
+        marker is stored in the persistent cache metadata and later startups
+        skip it entirely. Recipes without a source_path in their JSON file
+        would otherwise be re-read and re-parsed on every startup. New or
+        changed recipe files still get source_path from the normal parse path
+        during reconciliation.
+
+        Returns True if any recipes were updated (caller should persist cache).
+        """
+        cache = self._persistent_cache
+        if (
+            cache is not None
+            and cache.get_metadata_value(self._SOURCE_PATH_BACKFILL_MARKER) == "1"
+        ):
+            return False
+        updated = False
+        for recipe in recipes:
+            if recipe.get("source_path"):
+                continue
+            recipe_id = str(recipe.get("id", ""))
+            json_path = json_paths.get(recipe_id)
+            if not json_path or not os.path.exists(json_path):
+                continue
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    json_data = json.load(f)
+                file_source_path = json_data.get("source_path")
+                if file_source_path:
+                    recipe["source_path"] = file_source_path
+                    updated = True
+            except Exception:
+                pass
+        if cache is not None:
+            cache.set_metadata_value(self._SOURCE_PATH_BACKFILL_MARKER, "1")
+        return updated
+
+    def _full_directory_scan_sync(
+        self,
+        recipes_dir: str,
+        progress_loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Perform a full synchronous directory scan for recipes.
+
+        Args:
+            recipes_dir: Path to the recipes directory.
+            progress_loop: When set (manual force-refresh only), broadcast
+                scan_progress messages through this thread-local event loop.
+
+        Returns:
+            Tuple of (recipes list, json_paths dict).
+        """
+        recipes: List[Dict[str, Any]] = []
+        json_paths: Dict[str, str] = {}
+
+        # Get all recipe JSON files
+        recipe_files = []
+        for root, _, files in os.walk(recipes_dir):
+            for file in files:
+                if file.lower().endswith(".recipe.json"):
+                    recipe_files.append(os.path.join(root, file))
+
+        total_files = len(recipe_files)
+        if progress_loop is not None:
+            progress_loop.run_until_complete(
+                self._broadcast_scan_progress(
+                    'processing', 'count_models', 1, True,
+                    processed=0, total=total_files,
+                )
+            )
+
+        last_progress_time = time.time()
+
+        # Process each recipe file
+        for i, recipe_path in enumerate(recipe_files):
+            recipe_data = self._load_recipe_file_sync(recipe_path)
+            if recipe_data:
+                recipe_id = str(recipe_data.get("id", ""))
+                recipes.append(recipe_data)
+                json_paths[recipe_id] = recipe_path
+            if progress_loop is not None and total_files > 0:
+                processed = i + 1
+                current_time = time.time()
+                # Throttle to one update per 0.5s; always send the final one.
+                if (
+                    processed == total_files
+                    or current_time - last_progress_time > 0.5
+                ):
+                    last_progress_time = current_time
+                    progress_percent = min(99, int(1 + (processed / total_files) * 98))
+                    progress_loop.run_until_complete(
+                        self._broadcast_scan_progress(
+                            'processing', 'process_models', progress_percent, True,
+                            processed=processed, total=total_files,
+                            current_name=os.path.basename(recipe_path),
+                        )
+                    )
+            # Periodically release GIL so the event loop thread can run
+            if i % 100 == 0:
+                time.sleep(0)
+
+        return recipes, json_paths
+
+    @staticmethod
+    def _detect_has_workflow(image_path: Optional[str]) -> bool:
+        """Detect whether the recipe image embeds a ComfyUI workflow.
+
+        Reuses ``ExifUtils._load_structured_metadata`` so the metadata parsing
+        stays in one place. Any failure (missing/corrupt image, unsupported
+        format, unexpected exception) maps to ``False`` and never propagates —
+        recipe loading must remain resilient.
+        """
+        if not image_path or not os.path.exists(image_path):
+            return False
+        try:
+            metadata = ExifUtils._load_structured_metadata(image_path)
+            return bool(metadata.get("workflow"))
+        except Exception:
+            return False
+
+    def _load_recipe_file_sync(self, recipe_path: str) -> Optional[Dict[str, Any]]:
+        """Load a single recipe file synchronously.
+
+        Args:
+            recipe_path: Path to the recipe JSON file.
+
+        Returns:
+            Recipe dictionary if valid, None otherwise.
+        """
+        try:
+            with open(recipe_path, "r", encoding="utf-8") as f:
+                recipe_data = json.load(f)
+
+            # Validate recipe data
+            if not recipe_data or not isinstance(recipe_data, dict):
+                logger.warning(f"Invalid recipe data in {recipe_path}")
+                return None
+
+            # Ensure required fields exist
+            required_fields = ["id", "file_path", "title"]
+            if not all(field in recipe_data for field in required_fields):
+                logger.warning(f"Missing required fields in {recipe_path}")
+                return None
+
+            # Ensure the image file exists and prioritize local siblings
+            image_path = recipe_data.get("file_path")
+            path_updated = False
+            if image_path:
+                recipe_dir = os.path.dirname(recipe_path)
+                image_filename = os.path.basename(image_path)
+                local_sibling_path = os.path.normpath(
+                    os.path.join(recipe_dir, image_filename)
+                )
+
+                # If local sibling exists and stored path is different, prefer local
+                if (
+                    os.path.exists(local_sibling_path)
+                    and os.path.normpath(image_path) != local_sibling_path
+                ):
+                    recipe_data["file_path"] = local_sibling_path
+                    path_updated = True
+                    logger.info(
+                        f"Updated recipe image path to local sibling: {local_sibling_path}"
+                    )
+                elif not os.path.exists(image_path):
+                    logger.warning(
+                        f"Recipe image not found and no local sibling: {image_path}"
+                    )
+
+            if path_updated:
+                try:
+                    with open(recipe_path, "w", encoding="utf-8") as f:
+                        json.dump(recipe_data, f, indent=4, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"Failed to persist repair for {recipe_path}: {e}")
+
+            # Detect embedded ComfyUI workflow and persist when it changed
+            if "has_workflow" not in recipe_data:
+                has_workflow = self._detect_has_workflow(recipe_data.get("file_path"))
+                if has_workflow != recipe_data.get("has_workflow"):
+                    recipe_data["has_workflow"] = has_workflow
+                    try:
+                        with open(recipe_path, "w", encoding="utf-8") as f:
+                            json.dump(recipe_data, f, indent=4, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to persist has_workflow for {recipe_path}: {e}"
+                        )
+
+            # Track folder placement relative to recipes directory
+            recipe_data["folder"] = recipe_data.get("folder") or self._calculate_folder(
+                recipe_path
+            )
+
+            # Ensure loras array exists
+            if "loras" not in recipe_data:
+                recipe_data["loras"] = []
+
+            # Ensure gen_params exists
+            if "gen_params" not in recipe_data:
+                recipe_data["gen_params"] = {}
+
+            return recipe_data
+        except Exception as e:
+            logger.error(f"Error loading recipe file {recipe_path}: {e}")
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            return None
+
+    def _sort_cache_sync(self) -> None:
+        """Sort cache data synchronously."""
+        if self._cache is None:
+            return
+        try:
+            # Sort by name
+            self._cache.sorted_by_name = natsorted(
+                self._cache.raw_data, key=lambda x: x.get("title", "").lower()
+            )
+
+            # Sort by date (modified or created)
+            self._cache.sorted_by_date = sorted(
+                self._cache.raw_data,
+                key=lambda x: (
+                    x.get("modified", x.get("created_date", 0)),
+                    x.get("file_path", ""),
+                ),
+                reverse=True,
+            )
+        except Exception as e:
+            logger.error(f"Error sorting recipe cache: {e}")
+
+    def _build_image_id_map(self) -> Dict[str, str]:
+        """Build civitai image_id → recipe_id mapping from cached recipes.
+
+        Only recipes with a valid CivitAI image URL source_path produce an
+        entry.  Recipes imported from local files are naturally excluded.
+        """
+        mapping: Dict[str, str] = {}
+        if not self._cache:
+            return mapping
+        for recipe in getattr(self._cache, "raw_data", []):
+            if not isinstance(recipe, dict):
+                continue
+            source = recipe.get("source_path")
+            if not source:
+                continue
+            from ..utils.civitai_utils import extract_civitai_image_id
+
+            image_id = extract_civitai_image_id(source)
+            if image_id and image_id not in mapping:
+                recipe_id = recipe.get("id")
+                if recipe_id is not None:
+                    mapping[image_id] = str(recipe_id)
+        return mapping
+
+    async def _wait_for_lora_scanner(self) -> None:
+        """Ensure the LoRA scanner has initialized before recipe enrichment."""
+
+        if not getattr(self, "_lora_scanner", None):
+            return
+
+        lora_scanner = self._lora_scanner
+        cache_ready = getattr(lora_scanner, "_cache", None) is not None
+
+        # If cache is already available, we can proceed
+        if cache_ready:
+            return
+
+        # Await an existing initialization task if present
+        task = getattr(lora_scanner, "_initialization_task", None)
+        if task and hasattr(task, "done") and not task.done():
+            try:
+                await task
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+            if getattr(lora_scanner, "_cache", None) is not None:
+                return
+
+        # Otherwise, request initialization and proceed once it completes
+        try:
+            await lora_scanner.initialize_in_background()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.debug("Recipe Scanner: LoRA init request failed: %s", exc)
+
+    def _schedule_post_scan_enrichment(self) -> None:
+        """Kick off a non-blocking enrichment pass to fill remote metadata."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        if self._post_scan_task and not self._post_scan_task.done():
+            return
+
+        async def _run_enrichment():
+            try:
+                await self._enrich_cache_metadata()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.error(
+                    "Recipe Scanner: error during post-scan enrichment: %s",
+                    exc,
+                    exc_info=True,
+                )
+
+        self._post_scan_task = loop.create_task(
+            _run_enrichment(), name="recipe_cache_enrichment"
+        )
+
+    def _schedule_fts_index_build(self) -> None:
+        """Build FTS index in background without blocking.
+
+        Validates existing index first and reuses it if valid.
+        """
+
+        if self._fts_index_task and not self._fts_index_task.done():
+            return  # Already running
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _build_fts():
+            if self._cache is None:
+                return
+
+            try:
+                from .recipe_fts_index import RecipeFTSIndex
+
+                self._fts_index = RecipeFTSIndex()
+
+                # Check if existing index is valid
+                recipe_ids = {
+                    str(r.get("id", "")) for r in self._cache.raw_data if r.get("id")
+                }
+                recipe_count = len(self._cache.raw_data)
+
+                # Run validation in thread pool
+                is_valid = await loop.run_in_executor(
+                    None, self._fts_index.validate_index, recipe_count, recipe_ids
+                )
+
+                if is_valid:
+                    logger.info(
+                        "FTS index validated, reusing existing index with %d recipes",
+                        recipe_count,
+                    )
+                    self._fts_index._ready.set()
+                    return
+
+                # Only rebuild if validation fails
+                logger.info("FTS index invalid or outdated, rebuilding...")
+                await loop.run_in_executor(
+                    None, self._fts_index.build_index, self._cache.raw_data
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Recipe Scanner: error building FTS index: %s", exc, exc_info=True
+                )
+
+        self._fts_index_task = loop.create_task(
+            _build_fts(), name="recipe_fts_index_build"
+        )
+
+    def _search_with_fts(self, search: str, search_options: Dict[str, Any]) -> Optional[Set[str]]:
+        """Search recipes using FTS index if available.
+
+        Args:
+            search: The search query string.
+            search_options: Dictionary of search options (title, tags, lora_name, lora_model, prompt).
+
+        Returns:
+            Set of matching recipe IDs if FTS is available and search succeeded,
+            None if FTS is not ready (caller should fall back to fuzzy search).
+        """
+        if not self._fts_index or not self._fts_index.is_ready():
+            return None
+
+        # Build the set of fields to search based on search_options
+        fields: Optional[Set[str]] = set()
+        if search_options.get("title", True):
+            fields.add("title")
+        if search_options.get("tags", True):
+            fields.add("tags")
+        if search_options.get("lora_name", True):
+            fields.add("lora_name")
+        if search_options.get("lora_model", True):
+            fields.add("lora_model")
+        if search_options.get("prompt", False):  # prompt search is opt-in by default
+            fields.add("prompt")
+
+        # If no fields enabled, search all fields
+        if not fields:
+            fields = None
+
+        try:
+            result = self._fts_index.search(search, fields)
+            # Return empty set for empty FTS results — do NOT fall back to
+            # Python fuzzy matching, which freezes the server with 10k+ recipes.
+            # FTS5 prefix matching with unicode61 tokenizer correctly handles
+            # compound tokens (e.g. "illustrious" matches "path/illustrious/model").
+            # If FTS returns nothing, there are genuinely no matching recipes.
+            if not result:
+                return set()
+            return result
+        except Exception as exc:
+            logger.debug("FTS search failed, falling back to title-only search: %s", exc)
+            return None
+
+    def _update_fts_index_for_recipe(
+        self, recipe: Union[Dict[str, Any], str], operation: str = "add"
+    ) -> None:
+        """Update FTS index for a single recipe (add, update, or remove).
+
+        Args:
+            recipe: The recipe dictionary, or a recipe ID string for removal.
+            operation: One of 'add', 'update', or 'remove'.
+        """
+        if not self._fts_index or not self._fts_index.is_ready():
+            return
+
+        try:
+            if operation == "remove":
+                recipe_id = (
+                    str(recipe.get("id", ""))
+                    if isinstance(recipe, dict)
+                    else str(recipe)
+                )
+                self._fts_index.remove_recipe(recipe_id)
+            elif operation in ("add", "update"):
+                self._fts_index.update_recipe(cast(Dict[str, Any], recipe))
+        except Exception as exc:
+            logger.debug("Failed to update FTS index for recipe: %s", exc)
+
+    @staticmethod
+    def _normalize_recipe_gen_params(recipe_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a recipe copy with normalized generation parameter aliases added."""
+
+        normalized_recipe = dict(recipe_data)
+        gen_params = recipe_data.get("gen_params")
+        if not isinstance(gen_params, dict):
+            return normalized_recipe
+
+        normalized_gen_params = dict(gen_params)
+        for key, value in gen_params.items():
+            if value in (None, ""):
+                continue
+
+            from ..recipes.merger import GenParamsMerger
+
+            normalized_key = GenParamsMerger.NORMALIZATION_MAPPING.get(key, key)
+            if normalized_key not in GenParamsMerger.ALLOWED_KEYS:
+                continue
+
+            if normalized_gen_params.get(normalized_key) in (None, ""):
+                normalized_gen_params[normalized_key] = value
+
+        normalized_recipe["gen_params"] = normalized_gen_params
+        return normalized_recipe
+
+    async def _enrich_cache_metadata(self) -> None:
+        """Perform remote metadata enrichment after the initial scan."""
+
+        cache = self._cache
+        if cache is None or not getattr(cache, "raw_data", None):
+            return
+
+        for index, recipe in enumerate(list(cache.raw_data)):
+            try:
+                metadata_updated = await self._update_lora_information(recipe)
+                if metadata_updated:
+                    recipe_id = recipe.get("id")
+                    if recipe_id:
+                        recipe_path = os.path.join(
+                            self.recipes_dir, f"{recipe_id}.recipe.json"
+                        )
+                        if os.path.exists(recipe_path):
+                            try:
+                                self._write_recipe_file(recipe_path, recipe)
+                            except (
+                                Exception
+                            ) as exc:  # pragma: no cover - best-effort persistence
+                                logger.debug(
+                                    "Recipe Scanner: could not persist recipe %s: %s",
+                                    recipe_id,
+                                    exc,
+                                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error(
+                    "Recipe Scanner: error enriching recipe %s: %s",
+                    recipe.get("id"),
+                    exc,
+                    exc_info=True,
+                )
+
+            await asyncio.sleep(0)
+
+        try:
+            await cache.resort()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Recipe Scanner: error resorting cache after enrichment: %s", exc
+            )
+
+    def _schedule_resort(self, *, name_only: bool = False) -> None:
+        """Schedule a background resort of the recipe cache."""
+
+        cache = self._cache
+        if not cache:
+            return
+
+        # Keep folder metadata up to date alongside sort order
+        self._update_folder_metadata()
+
+        async def _resort_wrapper() -> None:
+            try:
+                await cache.resort(name_only=name_only)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error(
+                    "Recipe Scanner: error resorting cache: %s", exc, exc_info=True
+                )
+
+        task = asyncio.create_task(_resort_wrapper())
+        self._resort_tasks.add(task)
+        task.add_done_callback(lambda finished: self._resort_tasks.discard(finished))
+
+    def _calculate_folder(self, recipe_path: str) -> str:
+        """Calculate a normalized folder path relative to ``recipes_dir``."""
+
+        recipes_dir = self.recipes_dir
+        if not recipes_dir:
+            return ""
+
+        try:
+            recipe_dir = os.path.dirname(os.path.normpath(recipe_path))
+            relative_dir = os.path.relpath(recipe_dir, recipes_dir)
+            if relative_dir in (".", ""):
+                return ""
+            return relative_dir.replace(os.path.sep, "/")
+        except Exception:
+            return ""
+
+    def _build_folder_tree(self, folders: list[str]) -> Dict[str, Any]:
+        """Build a nested folder tree structure from relative folder paths."""
+
+        tree: dict[str, Dict[str, Any]] = {}
+        for folder in folders:
+            if not folder:
+                continue
+
+            parts = folder.split("/")
+            current_level = tree
+
+            for part in parts:
+                if part not in current_level:
+                    current_level[part] = {}
+                current_level = current_level[part]
+
+        return tree
+
+    def _update_folder_metadata(self, cache: RecipeCache | None = None) -> None:
+        """Ensure folder lists and tree metadata are synchronized with cache contents."""
+
+        cache = cache or self._cache
+        if cache is None:
+            return
+
+        folders: set[str] = set()
+        for item in cache.raw_data:
+            folder_value = item.get("folder", "")
+            if folder_value is None:
+                folder_value = ""
+            if folder_value == ".":
+                folder_value = ""
+            normalized = str(folder_value).replace("\\", "/")
+            item["folder"] = normalized
+            folders.add(normalized)
+
+        cache.folders = sorted(folders, key=lambda entry: entry.lower())
+        cache.folder_tree = self._build_folder_tree(cache.folders)
+
+    async def get_folders(self) -> list[str]:
+        """Return a sorted list of recipe folders relative to the recipes root."""
+
+        cache = await self.get_cached_data()
+        self._update_folder_metadata(cache)
+        return cache.folders or []
+
+    async def get_folder_tree(self) -> Dict[str, Any]:
+        """Return a hierarchical tree of recipe folders for sidebar navigation."""
+
+        cache = await self.get_cached_data()
+        self._update_folder_metadata(cache)
+        return cache.folder_tree or {}
+
+    @property
+    def recipes_dir(self) -> str:
+        """Get path to recipes directory"""
+        from .settings_manager import get_settings_manager
+
+        custom_recipes_dir = get_settings_manager().get("recipes_path", "")
+        if isinstance(custom_recipes_dir, str) and custom_recipes_dir.strip():
+            recipes_dir = os.path.abspath(
+                os.path.normpath(os.path.expanduser(custom_recipes_dir.strip()))
+            )
+            os.makedirs(recipes_dir, exist_ok=True)
+            return recipes_dir
+
+        if not config.loras_roots:
+            return ""
+
+        # config.loras_roots already sorted case-insensitively, use the first one
+        recipes_dir = os.path.join(config.loras_roots[0], "recipes")
+        os.makedirs(recipes_dir, exist_ok=True)
+
+        return recipes_dir
+
+    async def get_cached_data(self, force_refresh: bool = False) -> RecipeCache:
+        """Get cached recipe data, refresh if needed"""
+        # If a background initialization is in progress, wait for it to
+        # complete so callers never observe the placeholder empty cache.
+        initialization_task = self._initialization_task
+        if (
+            self._is_initializing
+            and not force_refresh
+            and initialization_task is not None
+            and initialization_task is not asyncio.current_task()
+            and not initialization_task.done()
+        ):
+            try:
+                await initialization_task
+            except Exception:
+                # Initialization failures are logged by the task itself; fall
+                # through and return whatever cache state we have.
+                pass
+
+        # If cache is already initialized and no refresh is needed, return it immediately
+        if self._cache is not None and not force_refresh:
+            self._update_folder_metadata()
+            return cast(RecipeCache, self._cache)
+
+        # If force refresh is requested, re-scan in a thread pool to avoid
+        # blocking the event loop (which is shared with ComfyUI).
+        if force_refresh:
+            try:
+                async with self._initialization_lock:
+                    self._is_initializing = True
+
+                    try:
+                        # Invalidate persistent cache so the sync path does a
+                        # full directory scan instead of reconciling stale data.
+                        if self._persistent_cache:
+                            self._persistent_cache.save_cache([], {})
+                        self._json_path_map = {}
+
+                        start_time = time.time()
+
+                        # Run the heavy lifting in a thread pool – same path
+                        # used by initialize_in_background(). Pass
+                        # report_progress=True so manual refreshes broadcast
+                        # scan_progress updates; startup init keeps it off.
+                        loop = asyncio.get_event_loop()
+                        cache = await loop.run_in_executor(
+                            None,
+                            self._initialize_recipe_cache_sync,
+                            True,
+                        )
+                        if cache is not None:
+                            self._cache = cache
+
+                        elapsed = time.time() - start_time
+                        count = len(self._cache.raw_data) if self._cache else 0
+                        logger.info(
+                            "Recipe cache force-refreshed in %.2f seconds. "
+                            "Found %d recipes",
+                            elapsed,
+                            count,
+                        )
+
+                        # Schedule non-blocking background work
+                        self._schedule_post_scan_enrichment()
+                        self._schedule_fts_index_build()
+
+                        return cast(RecipeCache, self._cache)
+
+                    except Exception as e:
+                        logger.error(
+                            f"Recipe Manager: Error initializing cache: {e}",
+                            exc_info=True,
+                        )
+                        self._cache = RecipeCache(
+                            raw_data=[],
+                            sorted_by_name=[],
+                            sorted_by_date=[],
+                            folders=[],
+                            folder_tree={},
+                        )
+                        return self._cache
+                    finally:
+                        self._is_initializing = False
+
+            except Exception as e:
+                logger.error(f"Unexpected error in get_cached_data: {e}")
+
+        # Return the cache (may be empty or partially initialized)
+        return self._cache or RecipeCache(
+            raw_data=[],
+            sorted_by_name=[],
+            sorted_by_date=[],
+            folders=[],
+            folder_tree={},
+        )
+
+    async def refresh_cache(self, force: bool = False) -> RecipeCache:
+        """Public helper to refresh or return the recipe cache."""
+
+        return await self.get_cached_data(force_refresh=force)
+
+    async def add_recipe(self, recipe_data: Dict[str, Any]) -> None:
+        """Add a recipe to the in-memory cache."""
+
+        if not recipe_data:
+            return
+
+        cache = await self.get_cached_data()
+        await cache.add_recipe(recipe_data, resort=False)
+        self._update_folder_metadata(cache)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_data, "add")
+
+        source = recipe_data.get("source_path")
+        if source:
+            from ..utils.civitai_utils import extract_civitai_image_id
+
+            image_id = extract_civitai_image_id(source)
+            if image_id:
+                recipe_id_value = recipe_data.get("id")
+                if recipe_id_value is not None:
+                    cache.image_id_map[image_id] = str(recipe_id_value)
+
+        # Persist to SQLite cache
+        if self._persistent_cache:
+            recipe_id = str(recipe_data.get("id", ""))
+            json_path = self._json_path_map.get(recipe_id, "")
+            self._persistent_cache.update_recipe(recipe_data, json_path)
+            self._persistent_cache.save_image_id_map(cache.image_id_map)
+
+    async def remove_recipe(self, recipe_id: str) -> bool:
+        """Remove a recipe from the cache by ID."""
+
+        if not recipe_id:
+            return False
+
+        cache = await self.get_cached_data()
+        removed = await cache.remove_recipe(recipe_id, resort=False)
+        if removed is None:
+            return False
+
+        self._update_folder_metadata(cache)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_id, "remove")
+
+        # Remove any image_id entry pointing to this recipe
+        stale = [k for k, v in cache.image_id_map.items() if v == recipe_id]
+        for k in stale:
+            del cache.image_id_map[k]
+
+        # Remove from SQLite cache
+        if self._persistent_cache:
+            self._persistent_cache.remove_recipe(recipe_id)
+            self._persistent_cache.save_image_id_map(cache.image_id_map)
+            self._json_path_map.pop(recipe_id, None)
+
+        return True
+
+    async def bulk_remove(self, recipe_ids: Iterable[str]) -> int:
+        """Remove multiple recipes from the cache."""
+
+        cache = await self.get_cached_data()
+        removed = await cache.bulk_remove(recipe_ids, resort=False)
+        if removed:
+            removed_ids = {str(r.get("id", "")) for r in removed}
+            stale = [k for k, v in cache.image_id_map.items() if v in removed_ids]
+            for k in stale:
+                del cache.image_id_map[k]
+
+            self._schedule_resort()
+            for recipe in removed:
+                recipe_id = str(recipe.get("id", ""))
+                self._update_fts_index_for_recipe(recipe_id, "remove")
+                if self._persistent_cache:
+                    self._persistent_cache.remove_recipe(recipe_id)
+                    self._json_path_map.pop(recipe_id, None)
+
+            if self._persistent_cache:
+                self._persistent_cache.save_image_id_map(cache.image_id_map)
+        return len(removed)
+
+    async def scan_all_recipes(self) -> List[Dict[str, Any]]:
+        """Scan all recipe JSON files and return metadata"""
+        recipes = []
+        recipes_dir = self.recipes_dir
+
+        if not recipes_dir or not os.path.exists(recipes_dir):
+            logger.warning(f"Recipes directory not found: {recipes_dir}")
+            return recipes
+
+        # Get all recipe JSON files in the recipes directory
+        recipe_files = []
+        for root, _, files in os.walk(recipes_dir):
+            recipe_count = sum(1 for f in files if f.lower().endswith(".recipe.json"))
+            if recipe_count > 0:
+                for file in files:
+                    if file.lower().endswith(".recipe.json"):
+                        recipe_files.append(os.path.join(root, file))
+
+        # Process each recipe file
+        for recipe_path in recipe_files:
+            recipe_data = await self._load_recipe_file(recipe_path)
+            if recipe_data:
+                recipes.append(recipe_data)
+
+        return recipes
+
+    async def _load_recipe_file(self, recipe_path: str) -> Optional[Dict[str, Any]]:
+        """Load recipe data from a JSON file"""
+        try:
+            with open(recipe_path, "r", encoding="utf-8") as f:
+                recipe_data = json.load(f)
+
+            # Validate recipe data
+            if not recipe_data or not isinstance(recipe_data, dict):
+                logger.warning(f"Invalid recipe data in {recipe_path}")
+                return None
+
+            # Ensure required fields exist
+            required_fields = ["id", "file_path", "title"]
+            for field in required_fields:
+                if field not in recipe_data:
+                    logger.warning(f"Missing required field '{field}' in {recipe_path}")
+                    return None
+
+            # Ensure the image file exists and prioritize local siblings
+            image_path = recipe_data.get("file_path")
+            path_updated = False
+            if image_path:
+                recipe_dir = os.path.dirname(recipe_path)
+                image_filename = os.path.basename(image_path)
+                local_sibling_path = os.path.normpath(
+                    os.path.join(recipe_dir, image_filename)
+                )
+
+                # If local sibling exists and stored path is different, prefer local
+                if (
+                    os.path.exists(local_sibling_path)
+                    and os.path.normpath(image_path) != local_sibling_path
+                ):
+                    recipe_data["file_path"] = local_sibling_path
+                    image_path = local_sibling_path
+                    path_updated = True
+                    logger.info(
+                        "Updated recipe image path to local sibling: %s",
+                        local_sibling_path,
+                    )
+                elif not os.path.exists(image_path):
+                    logger.warning(
+                        f"Recipe image not found and no local sibling: {image_path}"
+                    )
+
+            if path_updated:
+                self._write_recipe_file(recipe_path, recipe_data)
+
+            # Detect embedded ComfyUI workflow and persist when it changed
+            if "has_workflow" not in recipe_data:
+                has_workflow = self._detect_has_workflow(recipe_data.get("file_path"))
+                if has_workflow != recipe_data.get("has_workflow"):
+                    recipe_data["has_workflow"] = has_workflow
+                    self._write_recipe_file(recipe_path, recipe_data)
+
+            # Track folder placement relative to recipes directory
+            recipe_data["folder"] = recipe_data.get("folder") or self._calculate_folder(
+                recipe_path
+            )
+
+            # Ensure loras array exists
+            if "loras" not in recipe_data:
+                recipe_data["loras"] = []
+
+            # Ensure gen_params exists
+            if "gen_params" not in recipe_data:
+                recipe_data["gen_params"] = {}
+            recipe_data = self._normalize_recipe_gen_params(recipe_data)
+
+            # Update lora information with local paths and availability
+            lora_metadata_updated = await self._update_lora_information(recipe_data)
+
+            if recipe_data.get("checkpoint"):
+                checkpoint_entry = self._normalize_checkpoint_entry(
+                    recipe_data["checkpoint"]
+                )
+                if checkpoint_entry:
+                    recipe_data["checkpoint"] = self._enrich_checkpoint_entry(
+                        checkpoint_entry
+                    )
+                else:
+                    logger.warning(
+                        "Dropping invalid checkpoint entry in %s", recipe_path
+                    )
+                    recipe_data.pop("checkpoint", None)
+
+            # Calculate and update fingerprint if missing
+            if "loras" in recipe_data and "fingerprint" not in recipe_data:
+                from ..utils.utils import calculate_recipe_fingerprint
+
+                fingerprint = calculate_recipe_fingerprint(recipe_data["loras"])
+                recipe_data["fingerprint"] = fingerprint
+
+                # Write updated recipe data back to file
+                try:
+                    self._write_recipe_file(recipe_path, recipe_data)
+                    logger.info(f"Added fingerprint to recipe: {recipe_path}")
+                except Exception as e:
+                    logger.error(f"Error writing updated recipe with fingerprint: {e}")
+            elif lora_metadata_updated:
+                # Persist updates such as marking invalid entries as deleted
+                try:
+                    self._write_recipe_file(recipe_path, recipe_data)
+                except Exception as e:
+                    logger.error(f"Error writing updated recipe metadata: {e}")
+
+            return recipe_data
+        except Exception as e:
+            logger.error(f"Error loading recipe file {recipe_path}: {e}")
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            return None
+
+    @staticmethod
+    def _write_recipe_file(recipe_path: str, recipe_data: Dict[str, Any]) -> None:
+        """Persist ``recipe_data`` back to ``recipe_path`` with standard formatting."""
+
+        with open(recipe_path, "w", encoding="utf-8") as file_obj:
+            json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+    async def _update_lora_information(self, recipe_data: Dict[str, Any]) -> bool:
+        """Update LoRA information with hash and file_name
+
+        Returns:
+            bool: True if metadata was updated
+        """
+        if not recipe_data.get("loras"):
+            return False
+
+        metadata_updated = False
+
+        for lora in recipe_data["loras"]:
+            # Skip deleted loras that were already marked
+            if lora.get("isDeleted", False):
+                continue
+
+            # Skip if already has complete information
+            if "hash" in lora and "file_name" in lora and lora["file_name"]:
+                continue
+
+            # If has modelVersionId but no hash, look in lora cache first, then fetch from Civitai
+            if "modelVersionId" in lora and not lora.get("hash"):
+                model_version_id = lora["modelVersionId"]
+                # Check if model_version_id is an integer and > 0
+                if isinstance(model_version_id, int) and model_version_id > 0:
+                    # Try to find in lora cache first
+                    hash_from_cache = await self._find_hash_in_lora_cache(
+                        str(model_version_id)
+                    )
+                    if hash_from_cache:
+                        lora["hash"] = hash_from_cache
+                        metadata_updated = True
+                    else:
+                        # If not in cache, fetch from Civitai
+                        result = await self._get_hash_from_civitai(str(model_version_id))
+                        if isinstance(result, tuple):
+                            hash_from_civitai, is_deleted = result
+                            if hash_from_civitai:
+                                lora["hash"] = hash_from_civitai
+                                metadata_updated = True
+                            elif is_deleted:
+                                # Mark the lora as deleted if it was not found on Civitai
+                                lora["isDeleted"] = True
+                                logger.warning(
+                                    f"Marked lora with modelVersionId {model_version_id} as deleted"
+                                )
+                                metadata_updated = True
+                        else:
+                            # No hash returned; mark as deleted to avoid repeated lookups
+                            lora["isDeleted"] = True
+                            metadata_updated = True
+                            logger.warning(
+                                "Marked lora with modelVersionId %s as deleted after failed hash lookup",
+                                model_version_id,
+                            )
+
+            # If has hash but no file_name, look up in lora library
+            if "hash" in lora and (not lora.get("file_name") or not lora["file_name"]):
+                hash_value = lora["hash"]
+
+                if self._lora_scanner.has_hash(hash_value):
+                    lora_path = self._lora_scanner.get_path_by_hash(hash_value)
+                    if lora_path:
+                        file_name = os.path.splitext(os.path.basename(lora_path))[0]
+                        lora["file_name"] = file_name
+                        metadata_updated = True
+                else:
+                    # Lora not in library
+                    lora["file_name"] = ""
+                    metadata_updated = True
+
+        return metadata_updated
+
+    async def _find_hash_in_lora_cache(self, model_version_id: str) -> Optional[str]:
+        """Find hash in lora cache based on modelVersionId"""
+        try:
+            # Get all loras from cache
+            if not self._lora_scanner:
+                return None
+
+            cache = await self._lora_scanner.get_cached_data()
+            if not cache or not cache.raw_data:
+                return None
+
+            # Find lora with matching civitai.id
+            for lora in cache.raw_data:
+                civitai_data = lora.get("civitai", {})
+                if civitai_data and str(civitai_data.get("id", "")) == str(
+                    model_version_id
+                ):
+                    return lora.get("sha256")
+
+            return None
+        except Exception as e:
+            logger.error(f"Error finding hash in lora cache: {e}")
+            return None
+
+    async def _get_hash_from_civitai(self, model_version_id: str) -> Tuple[Optional[str], bool]:
+        """Get hash from Civitai API"""
+        try:
+            # Get metadata provider instead of civitai client directly
+            from .metadata_service import get_default_metadata_provider
+
+            metadata_provider = await get_default_metadata_provider()
+            if not metadata_provider:
+                logger.error("Failed to get metadata provider")
+                return None, False
+
+            version_info, error_msg = await metadata_provider.get_model_version_info(
+                model_version_id
+            )
+
+            if not version_info:
+                if error_msg and "model not found" in error_msg.lower():
+                    logger.warning(
+                        f"Model with version ID {model_version_id} was not found on Civitai - marking as deleted"
+                    )
+                    return None, True  # Return None hash and True for isDeleted flag
+                else:
+                    logger.debug(
+                        f"Could not get hash for modelVersionId {model_version_id}: {error_msg}"
+                    )
+                    return None, False  # Return None hash but not marked as deleted
+
+            # Get hash from the first file
+            for file_info in version_info.get("files", []):
+                sha256_hash = (file_info.get("hashes") or {}).get("SHA256")
+                if sha256_hash:
+                    return (
+                        sha256_hash,
+                        False,
+                    )  # Return hash with False for isDeleted flag
+
+            logger.debug(
+                f"No SHA256 hash found in version info for ID: {model_version_id}"
+            )
+            return None, False
+        except Exception as e:
+            logger.error(f"Error getting hash from Civitai: {e}")
+            return None, False
+
+    def _get_lora_from_version_index(
+        self, model_version_id: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Quickly fetch a cached LoRA entry by modelVersionId using the version index."""
+
+        if not self._lora_scanner:
+            return None
+
+        cache = getattr(self._lora_scanner, "_cache", None)
+        if cache is None:
+            return None
+
+        version_index = getattr(cache, "version_index", None)
+        if not version_index:
+            return None
+
+        try:
+            normalized_id = int(model_version_id)
+        except (TypeError, ValueError):
+            return None
+
+        return version_index.get(normalized_id)
+
+    def _get_checkpoint_from_version_index(
+        self, model_version_id: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a cached checkpoint entry by version id."""
+
+        if not self._checkpoint_scanner:
+            return None
+
+        cache = getattr(self._checkpoint_scanner, "_cache", None)
+        if cache is None:
+            return None
+
+        version_index = getattr(cache, "version_index", None)
+        if not version_index:
+            return None
+
+        try:
+            normalized_id = int(model_version_id)
+        except (TypeError, ValueError):
+            return None
+
+        return version_index.get(normalized_id)
+
+    async def _determine_base_model(self, loras: List[Dict[str, Any]]) -> Optional[str]:
+        """Determine the most common base model among LoRAs"""
+        base_models = {}
+
+        # Count occurrences of each base model
+        for lora in loras:
+            if "hash" in lora:
+                lora_path = self._lora_scanner.get_path_by_hash(lora["hash"])
+                if lora_path:
+                    base_model = await self._get_base_model_for_lora(lora_path)
+                    if base_model:
+                        base_models[base_model] = base_models.get(base_model, 0) + 1
+
+        # Return the most common base model
+        if base_models:
+            return max(base_models.items(), key=lambda x: x[1])[0]
+        return None
+
+    async def _get_base_model_for_lora(self, lora_path: str) -> Optional[str]:
+        """Get base model for a LoRA from cache"""
+        try:
+            if not self._lora_scanner:
+                return None
+
+            cache = await self._lora_scanner.get_cached_data()
+            if not cache or not cache.raw_data:
+                return None
+
+            # Find matching lora in cache
+            for lora in cache.raw_data:
+                if lora.get("file_path") == lora_path:
+                    return lora.get("base_model")
+
+            return None
+        except Exception as e:
+            logger.error(f"Error getting base model for lora: {e}")
+            return None
+
+    def _normalize_checkpoint_entry(
+        self, checkpoint_raw: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Coerce legacy or malformed checkpoint entries into a dict."""
+
+        if checkpoint_raw is None:
+            return None
+
+        if isinstance(checkpoint_raw, dict):
+            return dict(checkpoint_raw)
+
+        if isinstance(checkpoint_raw, (list, tuple)) and len(checkpoint_raw) == 1:
+            return self._normalize_checkpoint_entry(checkpoint_raw[0])
+
+        if isinstance(checkpoint_raw, str):
+            name = checkpoint_raw.strip()
+            if not name:
+                return None
+
+            file_name = os.path.splitext(os.path.basename(name))[0]
+            return {
+                "name": name,
+                "file_name": file_name,
+            }
+
+        return None
+
+    def _enrich_checkpoint_entry(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+        """Populate convenience fields for a checkpoint entry."""
+
+        if (
+            not checkpoint
+            or not isinstance(checkpoint, dict)
+            or not self._checkpoint_scanner
+        ):
+            return checkpoint
+
+        hash_value = (checkpoint.get("hash") or "").lower()
+        version_entry = None
+        model_version_id = checkpoint.get("id") or checkpoint.get("modelVersionId")
+        if not hash_value and model_version_id is not None:
+            version_entry = self._get_checkpoint_from_version_index(model_version_id)
+
+        try:
+            preview_url = checkpoint.get("preview_url") or checkpoint.get(
+                "thumbnailUrl"
+            )
+            if preview_url:
+                checkpoint["preview_url"] = self._normalize_preview_url(preview_url)
+
+            if hash_value:
+                checkpoint["inLibrary"] = self._checkpoint_scanner.has_hash(hash_value)
+                checkpoint["preview_url"] = self._normalize_preview_url(
+                    checkpoint.get("preview_url")
+                    or self._checkpoint_scanner.get_preview_url_by_hash(hash_value)
+                )
+                checkpoint["localPath"] = self._checkpoint_scanner.get_path_by_hash(
+                    hash_value
+                )
+            elif version_entry:
+                checkpoint["inLibrary"] = True
+                cached_path = version_entry.get("file_path") or version_entry.get(
+                    "path"
+                )
+                if cached_path:
+                    checkpoint.setdefault("localPath", cached_path)
+                    if not checkpoint.get("file_name"):
+                        checkpoint["file_name"] = os.path.splitext(
+                            os.path.basename(cached_path)
+                        )[0]
+
+                if version_entry.get("sha256") and not checkpoint.get("hash"):
+                    checkpoint["hash"] = version_entry.get("sha256")
+
+                preview_url = self._normalize_preview_url(
+                    version_entry.get("preview_url")
+                )
+                if preview_url:
+                    checkpoint.setdefault("preview_url", preview_url)
+
+                if version_entry.get("model_type"):
+                    checkpoint.setdefault("model_type", version_entry.get("model_type"))
+            else:
+                checkpoint.setdefault("inLibrary", False)
+
+            if checkpoint.get("preview_url"):
+                checkpoint["preview_url"] = self._normalize_preview_url(
+                    checkpoint["preview_url"]
+                )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Error enriching checkpoint entry %s: %s",
+                hash_value or model_version_id,
+                exc,
+            )
+
+        return checkpoint
+
+    def _enrich_lora_entry(self, lora: Dict[str, Any]) -> Dict[str, Any]:
+        """Populate convenience fields for a LoRA entry."""
+
+        if not lora or not self._lora_scanner:
+            return lora
+
+        hash_value = (lora.get("hash") or "").lower()
+        version_entry = None
+        if not hash_value and lora.get("modelVersionId") is not None:
+            version_entry = self._get_lora_from_version_index(
+                lora.get("modelVersionId")
+            )
+
+        try:
+            if hash_value:
+                lora["inLibrary"] = self._lora_scanner.has_hash(hash_value)
+                lora["preview_url"] = self._normalize_preview_url(
+                    self._lora_scanner.get_preview_url_by_hash(hash_value)
+                )
+                lora["localPath"] = self._lora_scanner.get_path_by_hash(hash_value)
+            elif version_entry:
+                lora["inLibrary"] = True
+                cached_path = version_entry.get("file_path") or version_entry.get(
+                    "path"
+                )
+                if cached_path:
+                    lora.setdefault("localPath", cached_path)
+                    if not lora.get("file_name"):
+                        lora["file_name"] = os.path.splitext(
+                            os.path.basename(cached_path)
+                        )[0]
+
+                if version_entry.get("sha256") and not lora.get("hash"):
+                    lora["hash"] = version_entry.get("sha256")
+
+                preview_url = self._normalize_preview_url(
+                    version_entry.get("preview_url")
+                )
+                if preview_url:
+                    lora.setdefault("preview_url", preview_url)
+            else:
+                lora.setdefault("inLibrary", False)
+
+            if lora.get("preview_url"):
+                lora["preview_url"] = self._normalize_preview_url(lora["preview_url"])
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Error enriching lora entry %s: %s", hash_value, exc)
+
+        return lora
+
+    def _compute_availability_statuses(self, recipe: Dict[str, Any]) -> Set[str]:
+        """Compute the LoRA availability status set for a recipe.
+
+        Returns ``{"ready"}`` when every non-excluded LoRA resolves to the
+        local library (recipes without LoRAs count as ready); otherwise a
+        subset of ``{"missing", "deleted"}``. Uses the same inLibrary
+        resolution as ``_enrich_lora_entry`` (hash index with modelVersionId
+        fallback) but performs only in-memory lookups.
+        """
+
+        statuses: Set[str] = set()
+        for lora in recipe.get("loras") or []:
+            if not isinstance(lora, dict) or lora.get("exclude"):
+                continue
+
+            in_library = False
+            if self._lora_scanner:
+                hash_value = (lora.get("hash") or "").lower()
+                if hash_value:
+                    in_library = self._lora_scanner.has_hash(hash_value)
+                elif lora.get("modelVersionId") is not None:
+                    in_library = (
+                        self._get_lora_from_version_index(lora.get("modelVersionId"))
+                        is not None
+                    )
+
+            if in_library:
+                continue
+            if lora.get("isDeleted"):
+                statuses.add("deleted")
+            else:
+                statuses.add("missing")
+
+        if not statuses:
+            statuses.add("ready")
+        return statuses
+
+    def _normalize_preview_url(self, preview_url: Optional[str]) -> Optional[str]:
+        """Return a preview URL that is reachable from the browser."""
+
+        if not preview_url or not isinstance(preview_url, str):
+            return preview_url
+
+        normalized = preview_url.strip()
+        if normalized.startswith("/api/lm/previews?path="):
+            return normalized
+
+        if os.path.isabs(normalized):
+            return config.get_preview_static_url(normalized)
+
+        return normalized
+
+    async def get_local_lora(
+        self, name: str, base_model: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Lookup an unambiguous local LoRA by name and optional base model."""
+
+        if not self._lora_scanner or not name:
+            return None
+
+        return await self._lora_scanner.get_model_info_by_name(
+            name, require_unique=True, base_model=base_model
+        )
+
+    async def find_local_loras_by_name(
+        self, name: str, base_model: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return every local LoRA matching ``name`` (used to explain lookup misses)."""
+
+        if not self._lora_scanner or not name:
+            return []
+
+        return await self._lora_scanner.find_models_by_name(name, base_model=base_model)
+
+    async def find_local_checkpoints_by_name(
+        self, name: str, base_model: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return every local checkpoint matching ``name`` (used to explain lookup misses)."""
+
+        checkpoint_scanner = getattr(self, "_checkpoint_scanner", None)
+        if not checkpoint_scanner or not name:
+            return []
+
+        return await checkpoint_scanner.find_models_by_name(
+            name, base_model=base_model
+        )
+
+    async def get_local_lora_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
+        """Lookup a local LoRA through the scanner's hash index."""
+
+        if not self._lora_scanner or not hash_value:
+            return None
+
+        file_path = self._lora_scanner.get_path_by_hash(hash_value)
+        if not file_path:
+            return None
+
+        target_path = os.path.normcase(os.path.abspath(file_path))
+        cached_data = await self._lora_scanner.get_cached_data()
+        for model in cached_data.raw_data:
+            model_path = model.get("file_path")
+            if model_path and os.path.normcase(os.path.abspath(model_path)) == target_path:
+                return model
+        return None
+
+    async def get_local_checkpoint(self, name: str) -> Optional[Dict[str, Any]]:
+        """Lookup a local checkpoint model by name."""
+
+        checkpoint_scanner = getattr(self, "_checkpoint_scanner", None)
+        if not checkpoint_scanner or not name:
+            return None
+
+        return await checkpoint_scanner.get_model_info_by_name(name)
+
+    async def get_paginated_data(
+        self,
+        page: int,
+        page_size: int,
+        sort_by: str = "date",
+        search: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        search_options: Optional[Dict[str, Any]] = None,
+        lora_hash: Optional[str] = None,
+        checkpoint_hash: Optional[str] = None,
+        bypass_filters: bool = True,
+        folder: str | None = None,
+        recursive: bool = True,
+    ):
+        """Get paginated and filtered recipe data
+
+        Args:
+            page: Current page number (1-based)
+            page_size: Number of items per page
+            sort_by: Sort method ('name', 'date', 'loras_count', 'opened',
+                or 'random' with an optional seed like 'random:abc123'; the
+                part after 'random:' is the shuffle seed, not a direction).
+                'opened' hides recipes that were never opened — it is a
+                "recently opened" view, not a plain reorder
+            search: Search term
+            filters: Dictionary of filters to apply
+            search_options: Dictionary of search options to apply
+            lora_hash: Optional SHA256 hash of a LoRA to filter recipes by
+            checkpoint_hash: Optional SHA256 hash of a checkpoint to filter recipes by
+            bypass_filters: If True, ignore other filters when a hash filter is provided
+            folder: Optional folder filter relative to recipes directory
+            recursive: Whether to include recipes in subfolders of the selected folder
+        """
+        cache = await self.get_cached_data()
+
+        # Get base dataset
+        sort_field = sort_by.split(":")[0] if ":" in sort_by else sort_by
+
+        if sort_field == "date":
+            filtered_data = list(cache.sorted_by_date)
+        elif sort_field == "name":
+            filtered_data = list(cache.sorted_by_name)
+        else:
+            filtered_data = list(cache.raw_data)
+
+        # Apply SFW filtering if enabled
+        from .settings_manager import get_settings_manager
+
+        settings = get_settings_manager()
+        if settings.get("show_only_sfw", False):
+            from ..utils.constants import NSFW_LEVELS
+
+            threshold = NSFW_LEVELS.get("R", 4)  # Default to R level (4) if not found
+            filtered_data = [
+                item
+                for item in filtered_data
+                if not item.get("preview_nsfw_level")
+                or item.get("preview_nsfw_level") < threshold
+            ]
+
+        # Special case: Filter by LoRA hash (takes precedence if bypass_filters is True)
+        if lora_hash:
+            # Filter recipes that contain this LoRA hash
+            filtered_data = [
+                item
+                for item in filtered_data
+                if "loras" in item
+                and any(
+                    lora.get("hash", "").lower() == lora_hash.lower()
+                    for lora in item["loras"]
+                )
+            ]
+
+            if bypass_filters:
+                # Skip other filters if bypass_filters is True
+                pass
+            # Otherwise continue with normal filtering after applying LoRA hash filter
+        elif checkpoint_hash:
+            normalized_checkpoint_hash = checkpoint_hash.lower()
+            filtered_data = [
+                item
+                for item in filtered_data
+                if isinstance(item.get("checkpoint"), dict)
+                and (item["checkpoint"].get("hash", "") or "").lower()
+                == normalized_checkpoint_hash
+            ]
+
+            if bypass_filters:
+                pass
+
+        has_hash_filter = bool(lora_hash or checkpoint_hash)
+
+        # Skip further filtering if we're only filtering by model hash with bypass enabled
+        if not (has_hash_filter and bypass_filters):
+            # Apply folder filter before other criteria
+            if folder is not None:
+                normalized_folder = folder.strip("/")
+
+                def matches_folder(item_folder: str) -> bool:
+                    item_path = (item_folder or "").strip("/")
+                    if recursive:
+                        if not normalized_folder:
+                            return True
+                        return item_path == normalized_folder or item_path.startswith(
+                            f"{normalized_folder}/"
+                        )
+                    return item_path == normalized_folder
+
+                filtered_data = [
+                    item
+                    for item in filtered_data
+                    if matches_folder(item.get("folder", ""))
+                ]
+
+            # Apply search filter
+            if search:
+                # Default search options if none provided
+                if not search_options:
+                    search_options = {
+                        "title": True,
+                        "tags": True,
+                        "lora_name": True,
+                        "lora_model": True,
+                    }
+
+                # Try FTS search first if available (much faster)
+                fts_matching_ids = self._search_with_fts(search, search_options)
+                if fts_matching_ids is not None:
+                    # FTS search succeeded, filter by matching IDs
+                    filtered_data = [
+                        item
+                        for item in filtered_data
+                        if str(item.get("id", "")) in fts_matching_ids
+                    ]
+                else:
+                    # FTS index not yet built — return empty rather than
+                    # scanning 42k+ items in Python. The FTS background build
+                    # finishes in seconds; by the time a user navigates here
+                    # and types a search, it is already available.
+                    logger.debug(
+                        "FTS index not ready — search '%s' returning empty", search
+                    )
+                    filtered_data = []
+
+            # Apply additional filters
+            if filters:
+                # Filter by base model
+                if "base_model" in filters and filters["base_model"]:
+                    base_model_filter = filters["base_model"]
+                    if UNKNOWN_BASE_MODEL_FILTER in base_model_filter:
+                        # The unknown bucket matches recipes whose base model
+                        # could not be determined (None/empty); real base
+                        # models in the list still match by exact name.
+                        filtered_data = [
+                            item
+                            for item in filtered_data
+                            if not item.get("base_model")
+                            or item.get("base_model") in base_model_filter
+                        ]
+                    else:
+                        filtered_data = [
+                            item
+                            for item in filtered_data
+                            if item.get("base_model", "") in base_model_filter
+                        ]
+
+                # Filter by favorite
+                if "favorite" in filters and filters["favorite"]:
+                    filtered_data = [
+                        item for item in filtered_data if item.get("favorite") is True
+                    ]
+
+                # Filter by tags
+                if "tags" in filters and filters["tags"]:
+                    tag_spec = filters["tags"]
+                    include_tags = set()
+                    exclude_tags = set()
+
+                    if isinstance(tag_spec, dict):
+                        for tag, state in tag_spec.items():
+                            if not tag:
+                                continue
+                            if state == "exclude":
+                                exclude_tags.add(tag)
+                            else:
+                                include_tags.add(tag)
+                    else:
+                        include_tags = {tag for tag in tag_spec if tag}
+
+                    if include_tags:
+
+                        def matches_include(item_tags):
+                            if not item_tags and "__no_tags__" in include_tags:
+                                return True
+                            return any(tag in include_tags for tag in (item_tags or []))
+
+                        filtered_data = [
+                            item
+                            for item in filtered_data
+                            if matches_include(item.get("tags"))
+                        ]
+
+                    if exclude_tags:
+
+                        def matches_exclude(item_tags):
+                            if not item_tags and "__no_tags__" in exclude_tags:
+                                return True
+                            return any(tag in exclude_tags for tag in (item_tags or []))
+
+                        filtered_data = [
+                            item
+                            for item in filtered_data
+                            if not matches_exclude(item.get("tags"))
+                        ]
+
+                # Filter by LoRA availability status
+                availability = filters.get("lora_availability")
+                if availability:
+                    selected = {
+                        status
+                        for status in availability
+                        if status in _VALID_LORA_AVAILABILITY_STATUSES
+                    }
+                    # Selecting every status (or none) means no filtering.
+                    if 0 < len(selected) < len(_VALID_LORA_AVAILABILITY_STATUSES):
+                        filtered_data = [
+                            item
+                            for item in filtered_data
+                            if self._compute_availability_statuses(item) & selected
+                        ]
+
+        # Apply sorting if not already handled by pre-sorted cache
+        if ":" in sort_by or sort_field in ("loras_count", "random", "opened"):
+            field, order = (sort_by.split(":") + ["desc"])[:2]
+            reverse = order.lower() == "desc"
+
+            if field == "name":
+                filtered_data = natsorted(
+                    filtered_data,
+                    key=lambda x: x.get("title", "").lower(),
+                    reverse=reverse,
+                )
+            elif field == "date":
+                # Use modified if available, falling back to created_date
+                filtered_data.sort(
+                    key=lambda x: (
+                        x.get("modified", x.get("created_date", 0)),
+                        x.get("file_path", ""),
+                    ),
+                    reverse=reverse,
+                )
+            elif field == "opened":
+                # "Recently Opened" view: recipes never opened are hidden.
+                # The open stats live outside recipe metadata; see
+                # RecipeOpenStats.
+                opened_map = RecipeOpenStats().get_opened_map()
+                filtered_data = [
+                    item
+                    for item in filtered_data
+                    if opened_map.get(str(item.get("id", ""))) is not None
+                ]
+                filtered_data.sort(
+                    key=lambda x: opened_map.get(str(x.get("id", "")), 0),
+                    reverse=reverse,
+                )
+            elif field == "loras_count":
+                filtered_data.sort(
+                    key=lambda x: len(x.get("loras", [])), reverse=reverse
+                )
+            elif field == "random":
+                # Seeded random shuffle: same seed -> same order (stable
+                # pagination across requests), matching the model pages.
+                seed = order if order.lower() not in ("asc", "desc") else None
+                rng = random.Random(seed or "random")
+                rng.shuffle(filtered_data)
+
+        # Calculate pagination
+        total_items = len(filtered_data)
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_items)
+
+        # Get paginated items
+        paginated_items = [
+            self._normalize_recipe_gen_params(item)
+            for item in filtered_data[start_idx:end_idx]
+        ]
+
+        # Add inLibrary information and URLs for each recipe
+        for item in paginated_items:
+            # Format file path to URL
+            if "file_path" in item:
+                item["file_url"] = self._format_file_url(item["file_path"])
+
+            # Format dates for display
+            for date_field in ["created_date", "modified"]:
+                if date_field in item:
+                    item[f"{date_field}_formatted"] = self._format_timestamp(
+                        item[date_field]
+                    )
+
+            if "loras" in item:
+                item["loras"] = [
+                    self._enrich_lora_entry(dict(lora)) for lora in item["loras"]
+                ]
+            if item.get("checkpoint"):
+                checkpoint_entry = self._normalize_checkpoint_entry(item["checkpoint"])
+                if checkpoint_entry:
+                    item["checkpoint"] = self._enrich_checkpoint_entry(checkpoint_entry)
+                else:
+                    item.pop("checkpoint", None)
+
+        result = {
+            "items": paginated_items,
+            "total": total_items,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total_items + page_size - 1) // page_size,
+        }
+
+        return result
+
+    async def get_recipe_by_id(self, recipe_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single recipe by ID with all metadata and formatted URLs
+
+        Args:
+            recipe_id: The ID of the recipe to retrieve
+
+        Returns:
+            Dict containing the recipe data or None if not found
+        """
+        if not recipe_id:
+            return None
+
+        # Get all recipes from cache
+        cache = await self.get_cached_data()
+
+        # Find the recipe with the specified ID
+        recipe = next(
+            (r for r in cache.raw_data if str(r.get("id", "")) == recipe_id), None
+        )
+
+        if not recipe:
+            return None
+
+        # Prefer the on-disk recipe JSON for fields that are not persisted in the
+        # SQLite cache yet, such as source_path.
+        merged_recipe = self._normalize_recipe_gen_params({**recipe})
+        recipe_json = await self._load_recipe_json(recipe_id)
+        if recipe_json:
+            for field in ("source_path", "checkpoint", "loras", "gen_params"):
+                if field not in recipe_json:
+                    merged_recipe.pop(field, None)
+            merged_recipe.update(recipe_json)
+
+        # Format the recipe with all needed information
+        formatted_recipe = {**merged_recipe}
+
+        # Fallback for recipes saved before has_workflow existed: detect once
+        # on demand so the modal button works without a rescan.
+        if "has_workflow" not in formatted_recipe:
+            formatted_recipe["has_workflow"] = self._detect_has_workflow(
+                formatted_recipe.get("file_path")
+            )
+
+        # Format file path to URL
+        if "file_path" in formatted_recipe:
+            formatted_recipe["file_url"] = self._format_file_url(
+                formatted_recipe["file_path"]
+            )
+
+        # Format dates for display
+        for date_field in ["created_date", "modified"]:
+            if date_field in formatted_recipe:
+                formatted_recipe[f"{date_field}_formatted"] = self._format_timestamp(
+                    formatted_recipe[date_field]
+                )
+
+        # Add lora metadata
+        if "loras" in formatted_recipe:
+            formatted_recipe["loras"] = [
+                self._enrich_lora_entry(dict(lora))
+                for lora in formatted_recipe["loras"]
+            ]
+        if formatted_recipe.get("checkpoint"):
+            checkpoint_entry = self._normalize_checkpoint_entry(
+                formatted_recipe["checkpoint"]
+            )
+            if checkpoint_entry:
+                formatted_recipe["checkpoint"] = self._enrich_checkpoint_entry(
+                    checkpoint_entry
+                )
+            else:
+                formatted_recipe.pop("checkpoint", None)
+
+        return formatted_recipe
+
+    async def _load_recipe_json(self, recipe_id: str) -> Optional[Dict[str, Any]]:
+        """Load the raw recipe JSON payload for a recipe ID if it exists."""
+
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            return None
+
+        try:
+            with open(recipe_json_path, "r", encoding="utf-8") as f:
+                recipe_data = json.load(f)
+        except Exception as exc:
+            logger.debug(
+                "Failed to load recipe JSON for %s from %s: %s",
+                recipe_id,
+                recipe_json_path,
+                exc,
+            )
+            return None
+
+        if not isinstance(recipe_data, dict):
+            return None
+
+        return self._normalize_recipe_gen_params(recipe_data)
+
+    def _format_file_url(self, file_path: Optional[str]) -> str:
+        """Format file path as URL for serving in web UI"""
+        if not file_path:
+            return "/loras_static/images/no-preview.png"
+
+        try:
+            normalized_path = os.path.normpath(file_path)
+            static_url = config.get_preview_static_url(normalized_path)
+            if static_url:
+                return static_url
+        except Exception as e:
+            logger.error(f"Error formatting file URL: {e}")
+            return "/loras_static/images/no-preview.png"
+
+        return "/loras_static/images/no-preview.png"
+
+    def _format_timestamp(self, timestamp: float) -> str:
+        """Format timestamp for display"""
+        from datetime import datetime
+
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    async def get_recipe_json_path(self, recipe_id: str) -> Optional[str]:
+        """Locate the recipe JSON file, accounting for folder placement."""
+
+        recipes_dir = self.recipes_dir
+        if not recipes_dir:
+            return None
+
+        cache = await self.get_cached_data()
+        folder = ""
+        for item in cache.raw_data:
+            if str(item.get("id")) == str(recipe_id):
+                folder = item.get("folder") or ""
+                break
+
+        candidate = os.path.normpath(
+            os.path.join(recipes_dir, folder, f"{recipe_id}.recipe.json")
+        )
+        if os.path.exists(candidate):
+            return candidate
+
+        for root, _, files in os.walk(recipes_dir):
+            if f"{recipe_id}.recipe.json" in files:
+                return os.path.join(root, f"{recipe_id}.recipe.json")
+
+        return None
+
+    async def update_recipe_metadata(self, recipe_id: str, metadata: Dict[str, Any]) -> bool:
+        """Update recipe metadata (like title and tags) in both file system and cache
+
+        Args:
+            recipe_id: The ID of the recipe to update
+            metadata: Dictionary containing metadata fields to update (title, tags, etc.)
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # First, find the recipe JSON file path
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            return False
+
+        try:
+            # Load existing recipe data
+            with open(recipe_json_path, "r", encoding="utf-8") as f:
+                recipe_data = json.load(f)
+
+            # Update fields
+            for key, value in metadata.items():
+                recipe_data[key] = value
+
+            # Save updated recipe
+            with open(recipe_json_path, "w", encoding="utf-8") as f:
+                json.dump(recipe_data, f, indent=4, ensure_ascii=False)
+
+            # Update the cache if it exists
+            if self._cache is not None:
+                await self._cache.update_recipe_metadata(
+                    recipe_id, metadata, resort=False
+                )
+                self._schedule_resort()
+
+            # Update FTS index
+            self._update_fts_index_for_recipe(recipe_data, "update")
+
+            # Update persistent SQLite cache
+            if self._persistent_cache:
+                self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+                self._json_path_map[recipe_id] = recipe_json_path
+
+            # If the recipe has an image, update its EXIF metadata
+            from ..utils.exif_utils import ExifUtils
+
+            image_path = recipe_data.get("file_path")
+            if image_path and os.path.exists(image_path):
+                ExifUtils.append_recipe_metadata(image_path, recipe_data)
+
+            return True
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).error(
+                f"Error updating recipe metadata: {e}", exc_info=True
+            )
+            return False
+
+    async def update_lora_entry(
+        self,
+        recipe_id: str,
+        lora_index: int,
+        *,
+        target_name: str,
+        target_lora: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Update a specific LoRA entry within a recipe.
+
+        Returns the updated recipe data and the refreshed LoRA metadata.
+        """
+
+        if target_name is None:
+            raise ValueError("target_name must be provided")
+
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            loras = recipe_data.get("loras", [])
+            if lora_index >= len(loras):
+                raise RecipeNotFoundError("LoRA index out of range in recipe")
+
+            lora_entry = loras[lora_index]
+            # Snapshot the pre-update state so the association can be restored
+            # later (undo reconnect). Never nest snapshots.
+            snapshot = {
+                key: copy.deepcopy(value)
+                for key, value in lora_entry.items()
+                if key != "reconnectSnapshot"
+            }
+            lora_entry["isDeleted"] = False
+            lora_entry["hashInvalid"] = False
+            lora_entry["exclude"] = False
+            lora_entry["file_name"] = target_name
+
+            if target_lora is not None:
+                sha_value = target_lora.get("sha256") or target_lora.get("sha")
+                if sha_value:
+                    lora_entry["hash"] = sha_value.lower()
+
+                civitai_info = target_lora.get("civitai") or {}
+                if civitai_info:
+                    lora_entry["modelName"] = civitai_info.get("model", {}).get(
+                        "name", ""
+                    )
+                    lora_entry["modelVersionName"] = civitai_info.get("name", "")
+                    lora_entry["modelVersionId"] = civitai_info.get("id")
+
+            lora_entry["reconnectSnapshot"] = snapshot
+
+            from ..utils.utils import calculate_recipe_fingerprint
+
+            recipe_data["fingerprint"] = calculate_recipe_fingerprint(
+                recipe_data.get("loras", [])
+            )
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_data, "update")
+
+        # Update persistent SQLite cache
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        updated_lora = dict(lora_entry)
+        if target_lora is not None:
+            preview_url = target_lora.get("preview_url")
+            if preview_url:
+                updated_lora["preview_url"] = config.get_preview_static_url(preview_url)
+            if target_lora.get("file_path"):
+                updated_lora["localPath"] = target_lora["file_path"]
+
+        updated_lora = self._enrich_lora_entry(updated_lora)
+        return recipe_data, updated_lora
+
+    async def restore_lora_entry(
+        self,
+        recipe_id: str,
+        lora_index: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Restore a LoRA entry to its pre-reconnect snapshot.
+
+        Reverses :meth:`update_lora_entry`: the entry saved under
+        ``reconnectSnapshot`` becomes the entry again and the snapshot is
+        dropped. Returns the updated recipe data and the restored LoRA
+        metadata.
+        """
+
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            loras = recipe_data.get("loras", [])
+            if lora_index < 0 or lora_index >= len(loras):
+                raise RecipeNotFoundError("LoRA index out of range in recipe")
+
+            snapshot = loras[lora_index].get("reconnectSnapshot")
+            if not isinstance(snapshot, dict):
+                raise RecipeValidationError(
+                    "LoRA entry has no reconnect snapshot to restore"
+                )
+
+            restored_entry = copy.deepcopy(snapshot)
+            restored_entry.pop("reconnectSnapshot", None)
+            loras[lora_index] = restored_entry
+
+            from ..utils.utils import calculate_recipe_fingerprint
+
+            recipe_data["fingerprint"] = calculate_recipe_fingerprint(
+                recipe_data.get("loras", [])
+            )
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_data, "update")
+
+        # Update persistent SQLite cache
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        restored_lora = self._enrich_lora_entry(dict(restored_entry))
+        return recipe_data, restored_lora
+
+    async def set_lora_entry_hash_invalid(
+        self,
+        recipe_id: str,
+        lora_index: int,
+        hash_invalid: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Set the ``hashInvalid`` flag on a specific LoRA entry.
+
+        ``hashInvalid`` records that the entry's hash could not be resolved
+        on CivitAI (e.g. a download attempt returned "Model not found").
+        Marking it makes the entry an unresolved rematch candidate without
+        touching its stored hash/file_name.
+
+        Returns:
+            The updated recipe data and the refreshed LoRA metadata.
+        """
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            loras = recipe_data.get("loras", [])
+            if lora_index >= len(loras):
+                raise RecipeNotFoundError("LoRA index out of range in recipe")
+
+            lora_entry = loras[lora_index]
+            if not isinstance(lora_entry, dict):
+                raise RecipeValidationError("LoRA entry is not a dict")
+
+            lora_entry["hashInvalid"] = bool(hash_invalid)
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        updated_lora = self._enrich_lora_entry(dict(lora_entry))
+        return recipe_data, updated_lora
+
+    async def update_checkpoint_entry(
+        self,
+        recipe_id: str,
+        *,
+        target_name: str,
+        target_checkpoint: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Update the checkpoint entry within a recipe (manual reconnect).
+
+        Mirrors :meth:`update_lora_entry`: the pre-update entry is snapshotted
+        under ``reconnectSnapshot`` so the association can be restored later,
+        then the matched local checkpoint is written back following the same
+        pinned key set as ``_write_rematch_checkpoint_entry``. ``file_name``
+        keeps the user-entered ``target_name`` (the same convention as the
+        LoRA reconnect), while hash/name/version/baseModel/identifier are
+        refreshed from the local item. The fingerprint is untouched — it is
+        computed over LoRAs only.
+
+        Returns:
+            The updated recipe data and the refreshed checkpoint metadata.
+        """
+        if target_name is None:
+            raise ValueError("target_name must be provided")
+
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            checkpoint = recipe_data.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                raise RecipeValidationError(
+                    "Recipe has no checkpoint entry to reconnect"
+                )
+
+            # Snapshot the pre-update state so the association can be restored
+            # later (undo reconnect). Never nest snapshots.
+            snapshot = {
+                key: copy.deepcopy(value)
+                for key, value in checkpoint.items()
+                if key != "reconnectSnapshot"
+            }
+            checkpoint["isDeleted"] = False
+            checkpoint["hashInvalid"] = False
+            checkpoint["file_name"] = target_name
+
+            if target_checkpoint is not None:
+                sha_value = target_checkpoint.get("sha256") or target_checkpoint.get(
+                    "sha"
+                )
+                if sha_value:
+                    checkpoint["hash"] = sha_value.lower()
+
+                self._write_rematch_checkpoint_entry(checkpoint, target_checkpoint)
+
+                # The write-back only refreshes keys the entry already has;
+                # a manual reconnect must also backfill the display keys so a
+                # sparse parser-style entry renders properly after the swap.
+                if not checkpoint.get("name") and target_checkpoint.get("model_name"):
+                    checkpoint["name"] = target_checkpoint["model_name"]
+                civitai = target_checkpoint.get("civitai") or {}
+                civ_name = civitai.get("name")
+                if not checkpoint.get("version") and civ_name:
+                    checkpoint["version"] = civ_name
+                if (
+                    not checkpoint.get("baseModel")
+                    and target_checkpoint.get("base_model")
+                ):
+                    checkpoint["baseModel"] = target_checkpoint["base_model"]
+
+            checkpoint["reconnectSnapshot"] = snapshot
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_data, "update")
+
+        # Update persistent SQLite cache
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        updated_checkpoint = dict(checkpoint)
+        if target_checkpoint is not None:
+            preview_url = target_checkpoint.get("preview_url")
+            if preview_url:
+                updated_checkpoint["preview_url"] = config.get_preview_static_url(
+                    preview_url
+                )
+            if target_checkpoint.get("file_path"):
+                updated_checkpoint["localPath"] = target_checkpoint["file_path"]
+
+        updated_checkpoint = self._enrich_checkpoint_entry(updated_checkpoint)
+        return recipe_data, updated_checkpoint
+
+    async def restore_checkpoint_entry(
+        self,
+        recipe_id: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Restore the checkpoint entry to its pre-reconnect snapshot.
+
+        Reverses :meth:`update_checkpoint_entry`: the entry saved under
+        ``reconnectSnapshot`` becomes the checkpoint again and the snapshot is
+        dropped. Returns the updated recipe data and the restored checkpoint
+        metadata.
+        """
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            checkpoint = recipe_data.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                raise RecipeValidationError(
+                    "Recipe has no checkpoint entry to restore"
+                )
+
+            snapshot = checkpoint.get("reconnectSnapshot")
+            if not isinstance(snapshot, dict):
+                raise RecipeValidationError(
+                    "Checkpoint entry has no reconnect snapshot to restore"
+                )
+
+            restored_entry = copy.deepcopy(snapshot)
+            restored_entry.pop("reconnectSnapshot", None)
+            recipe_data["checkpoint"] = restored_entry
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        # Update FTS index
+        self._update_fts_index_for_recipe(recipe_data, "update")
+
+        # Update persistent SQLite cache
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        restored_checkpoint = self._enrich_checkpoint_entry(dict(restored_entry))
+        return recipe_data, restored_checkpoint
+
+    async def set_checkpoint_entry_hash_invalid(
+        self,
+        recipe_id: str,
+        hash_invalid: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Set the ``hashInvalid`` flag on the recipe's checkpoint entry.
+
+        ``hashInvalid`` records that the entry's hash could not be resolved
+        on CivitAI (e.g. a download attempt returned "Model not found").
+        Marking it makes the entry an unresolved rematch candidate without
+        touching its stored hash/file_name.
+
+        Returns:
+            The updated recipe data and the refreshed checkpoint metadata.
+        """
+        recipe_json_path = await self.get_recipe_json_path(recipe_id)
+        if not recipe_json_path or not os.path.exists(recipe_json_path):
+            raise RecipeNotFoundError("Recipe not found")
+
+        async with self._mutation_lock:
+            with open(recipe_json_path, "r", encoding="utf-8") as file_obj:
+                recipe_data = json.load(file_obj)
+
+            checkpoint = recipe_data.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                raise RecipeValidationError("Checkpoint entry is not a dict")
+
+            checkpoint["hashInvalid"] = bool(hash_invalid)
+            recipe_data["modified"] = time.time()
+
+            with open(recipe_json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(recipe_data, file_obj, indent=4, ensure_ascii=False)
+
+        cache = await self.get_cached_data()
+        replaced = await cache.replace_recipe(recipe_id, recipe_data, resort=False)
+        if not replaced:
+            await cache.add_recipe(recipe_data, resort=False)
+        self._schedule_resort()
+
+        if self._persistent_cache:
+            self._persistent_cache.update_recipe(recipe_data, recipe_json_path)
+            self._json_path_map[recipe_id] = recipe_json_path
+
+        updated_checkpoint = self._enrich_checkpoint_entry(dict(checkpoint))
+        return recipe_data, updated_checkpoint
+
+    async def get_recipes_for_lora(self, lora_hash: str) -> List[Dict[str, Any]]:
+        """Return recipes that reference a given LoRA hash."""
+
+        if not lora_hash:
+            return []
+
+        normalized_hash = lora_hash.lower()
+        cache = await self.get_cached_data()
+        matching_recipes: List[Dict[str, Any]] = []
+
+        for recipe in cache.raw_data:
+            loras = recipe.get("loras", [])
+            if any(
+                (entry.get("hash") or "").lower() == normalized_hash for entry in loras
+            ):
+                recipe_copy = {**recipe}
+                recipe_copy["loras"] = [
+                    self._enrich_lora_entry(dict(entry)) for entry in loras
+                ]
+                recipe_copy["file_url"] = self._format_file_url(recipe.get("file_path"))
+                matching_recipes.append(recipe_copy)
+
+        return matching_recipes
+
+    async def get_recipes_for_checkpoint(
+        self, checkpoint_hash: str
+    ) -> List[Dict[str, Any]]:
+        """Return recipes that reference a given checkpoint hash."""
+
+        if not checkpoint_hash:
+            return []
+
+        normalized_hash = checkpoint_hash.lower()
+        cache = await self.get_cached_data()
+        matching_recipes: List[Dict[str, Any]] = []
+
+        for recipe in cache.raw_data:
+            checkpoint = self._normalize_checkpoint_entry(recipe.get("checkpoint"))
+            if not checkpoint:
+                continue
+
+            enriched_checkpoint = self._enrich_checkpoint_entry(dict(checkpoint))
+            if (enriched_checkpoint.get("hash") or "").lower() != normalized_hash:
+                continue
+
+            recipe_copy = {**recipe}
+            recipe_copy["checkpoint"] = enriched_checkpoint
+            recipe_copy["loras"] = [
+                self._enrich_lora_entry(dict(entry))
+                for entry in recipe.get("loras", [])
+            ]
+            recipe_copy["file_url"] = self._format_file_url(recipe.get("file_path"))
+            matching_recipes.append(recipe_copy)
+
+        return matching_recipes
+
+    async def get_recipe_syntax_tokens(self, recipe_id: str) -> List[str]:
+        """Build LoRA syntax tokens for a recipe."""
+
+        cache = await self.get_cached_data()
+        recipe = await cache.get_recipe(recipe_id)
+        if recipe is None:
+            raise RecipeNotFoundError("Recipe not found")
+
+        loras = recipe.get("loras", [])
+        if not loras:
+            return []
+
+        lora_cache = None
+        if self._lora_scanner is not None:
+            lora_cache = await self._lora_scanner.get_cached_data()
+
+        syntax_parts: List[str] = []
+        for lora in loras:
+            file_name = None
+            folder = ""
+            hash_value = (lora.get("hash") or "").lower()
+            if (
+                hash_value
+                and self._lora_scanner is not None
+                and hasattr(self._lora_scanner, "_hash_index")
+            ):
+                file_path = self._lora_scanner._hash_index.get_path(hash_value)
+                if file_path:
+                    file_name = os.path.splitext(os.path.basename(file_path))[0]
+                    if lora_cache is not None:
+                        for cached_lora in getattr(lora_cache, "raw_data", []):
+                            if cached_lora.get("file_path") == file_path:
+                                folder = cached_lora.get("folder", "")
+                                break
+
+            if not file_name and lora.get("modelVersionId") and lora_cache is not None:
+                for cached_lora in getattr(lora_cache, "raw_data", []):
+                    civitai_info = cached_lora.get("civitai")
+                    if civitai_info and civitai_info.get("id") == lora.get(
+                        "modelVersionId"
+                    ):
+                        cached_path = cached_lora.get("path") or cached_lora.get(
+                            "file_path"
+                        )
+                        if cached_path:
+                            file_name = os.path.splitext(os.path.basename(cached_path))[
+                                0
+                            ]
+                            folder = cached_lora.get("folder", "")
+                        break
+
+            if not file_name:
+                # LoRAs deleted from the source or with an unresolvable hash
+                # cannot be downloaded; skip them instead of emitting a token
+                # pointing at a file that does not exist locally.
+                if lora.get("isDeleted", False) or lora.get("hashInvalid", False):
+                    continue
+                file_name = lora.get("file_name", "unknown-lora")
+                folder = lora.get("folder", "")
+
+            lora_name = f"{folder}/{file_name}" if folder else file_name
+            strength = lora.get("strength", 1.0)
+            syntax_parts.append(f"<lora:{lora_name}:{strength}>")
+
+        return syntax_parts
+
+    async def update_lora_filename_by_hash(
+        self, hash_value: str, new_file_name: str
+    ) -> Tuple[int, int]:
+        """Update file_name in all recipes that contain a LoRA with the specified hash.
+
+        Args:
+            hash_value: The SHA256 hash value of the LoRA
+            new_file_name: The new file_name to set
+
+        Returns:
+            Tuple[int, int]: (number of recipes updated in files, number of recipes updated in cache)
+        """
+        if not hash_value or not new_file_name:
+            return 0, 0
+
+        # Always use lowercase hash for consistency
+        hash_value = hash_value.lower()
+
+        # Get cache
+        cache = await self.get_cached_data()
+        if not cache or not cache.raw_data:
+            return 0, 0
+
+        file_updated_count = 0
+        cache_updated_count = 0
+
+        # Find recipes that need updating from the cache
+        recipes_to_update = []
+        for recipe in cache.raw_data:
+            loras = recipe.get("loras", [])
+            if not isinstance(loras, list):
+                continue
+
+            has_match = False
+            for lora in loras:
+                if not isinstance(lora, dict):
+                    continue
+                if (lora.get("hash") or "").lower() == hash_value:
+                    if lora.get("file_name") != new_file_name:
+                        lora["file_name"] = new_file_name
+                        has_match = True
+
+            if has_match:
+                recipes_to_update.append(recipe)
+                cache_updated_count += 1
+
+        if not recipes_to_update:
+            return 0, 0
+
+        # Persist changes to disk and SQLite cache
+        async with self._mutation_lock:
+            for recipe in recipes_to_update:
+                recipe_id = str(recipe.get("id", ""))
+                if not recipe_id:
+                    continue
+
+                recipe_path = os.path.join(self.recipes_dir, f"{recipe_id}.recipe.json")
+                try:
+                    self._write_recipe_file(recipe_path, recipe)
+                    file_updated_count += 1
+                    logger.info(
+                        f"Updated file_name in recipe {recipe_path}: -> {new_file_name}"
+                    )
+
+                    # Update persistent SQLite cache
+                    if self._persistent_cache:
+                        self._persistent_cache.update_recipe(recipe, recipe_path)
+                        self._json_path_map[recipe_id] = recipe_path
+                except Exception as e:
+                    logger.error(f"Error updating recipe file {recipe_path}: {e}")
+
+        # We don't necessarily need to resort because LoRA file_name isn't a sort key,
+        # but we might want to schedule a resort if we're paranoid or if searching relies on sorted state.
+        # Given it's a rename of a dependency, search results might change if searching by LoRA name.
+        self._schedule_resort()
+
+        return file_updated_count, cache_updated_count
+
+    async def find_recipes_by_fingerprint(self, fingerprint: str) -> List[Dict[str, Any]]:
+        """Find recipes with a matching fingerprint
+
+        Args:
+            fingerprint: The recipe fingerprint to search for
+
+        Returns:
+            List of recipe details that match the fingerprint
+        """
+        if not fingerprint:
+            return []
+
+        # Get all recipes from cache
+        cache = await self.get_cached_data()
+
+        # Find recipes with matching fingerprint
+        matching_recipes = []
+        for recipe in cache.raw_data:
+            if recipe.get("fingerprint") == fingerprint:
+                recipe_details = {
+                    "id": recipe.get("id"),
+                    "title": recipe.get("title"),
+                    "file_url": self._format_file_url(recipe.get("file_path")),
+                    "modified": recipe.get("modified"),
+                    "created_date": recipe.get("created_date"),
+                    "lora_count": len(recipe.get("loras", [])),
+                }
+                matching_recipes.append(recipe_details)
+
+        return matching_recipes
+
+    async def find_all_duplicate_recipes(
+        self, include_prompt: bool = False
+    ) -> Dict[str, List[Any]]:
+        """Find all recipe duplicates based on fingerprints
+
+        When ``include_prompt`` is True, the grouping key additionally
+        includes the normalized positive prompt, so recipes are only grouped
+        when they share both the same LoRA combination (with identical
+        strengths) and the same prompt. Recipes with neither a fingerprint
+        nor a prompt are skipped.
+
+        Args:
+            include_prompt: Whether to require an identical prompt as well
+
+        Returns:
+            Dictionary where keys are grouping keys and values are lists of recipe IDs
+        """
+        # Get all recipes from cache
+        cache = await self.get_cached_data()
+
+        # Group recipes by fingerprint (optionally combined with the prompt)
+        fingerprint_groups = {}
+        for recipe in cache.raw_data:
+            grouping_key = self._build_duplicate_grouping_key(
+                recipe, include_prompt
+            )
+            if not grouping_key:
+                continue
+
+            if grouping_key not in fingerprint_groups:
+                fingerprint_groups[grouping_key] = []
+
+            fingerprint_groups[grouping_key].append(recipe.get("id"))
+
+        # Filter to only include groups with more than one recipe
+        duplicate_groups = {k: v for k, v in fingerprint_groups.items() if len(v) > 1}
+
+        return duplicate_groups
+
+    def _build_duplicate_grouping_key(
+        self, recipe: Dict[str, Any], include_prompt: bool
+    ) -> str:
+        """Build the grouping key used for duplicate detection.
+
+        Without ``include_prompt`` this is the stored fingerprint (same LoRA
+        combination at identical strengths). With it, the normalized positive
+        prompt is appended (separated by ``\\x1f``), so recipes must share
+        both factors to be grouped. Recipes with no loras still participate
+        when they carry a prompt, matching other no-lora recipes with the
+        same prompt.
+        """
+        fingerprint = recipe.get("fingerprint") or ""
+        if not include_prompt:
+            return fingerprint
+
+        from ..utils.utils import normalize_prompt_for_dedup
+
+        prompt = normalize_prompt_for_dedup(
+            (recipe.get("gen_params") or {}).get("prompt")
+        )
+        if not fingerprint and not prompt:
+            return ""
+        return f"{fingerprint}\x1f{prompt}"
+
+    async def find_duplicate_recipes_by_source(self) -> Dict[str, List[Any]]:
+        """Find all recipe duplicates based on source_path (Civitai image URLs)
+
+        Returns:
+            Dictionary where keys are source URLs and values are lists of recipe IDs
+        """
+        cache = await self.get_cached_data()
+
+        url_groups = {}
+        for recipe in cache.raw_data:
+            source_url = recipe.get("source_path", "").strip()
+            if not source_url:
+                continue
+
+            if source_url not in url_groups:
+                url_groups[source_url] = []
+
+            url_groups[source_url].append(recipe.get("id"))
+
+        duplicate_groups = {k: v for k, v in url_groups.items() if len(v) > 1}
+
+        return duplicate_groups

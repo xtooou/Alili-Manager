@@ -1,0 +1,61 @@
+<!-- Settings Modal -->
+<div id="settingsModal" class="modal">
+    <div class="modal-content settings-modal">
+        <button class="close" onclick="modalManager.closeModal('settingsModal')">&times;</button>
+        <div class="settings-header">
+            <h2>{{ t('common.actions.settings') }}</h2>
+            <button
+                type="button"
+                class="settings-action-link settings-open-location-trigger"
+                aria-label="{{ t('settings.openSettingsFileLocation.tooltip') }}"
+                title="{{ t('settings.openSettingsFileLocation.tooltip') }}">
+                <i class="fas fa-external-link-alt" aria-hidden="true"></i>
+            </button>
+            <div class="settings-search-wrapper">
+                <i class="fas fa-search settings-search-icon" aria-hidden="true"></i>
+                <input type="text"
+                       id="settingsSearchInput"
+                       class="settings-search-input"
+                       placeholder="{{ t('settings.search.placeholder') }}"
+                       aria-label="{{ t('settings.search.placeholder') }}"
+                       autocomplete="off">
+                <button type="button"
+                        id="settingsSearchClear"
+                        class="settings-search-clear"
+                        aria-label="{{ t('settings.search.clear') }}"
+                        style="display: none;">
+                    <i class="fas fa-times" aria-hidden="true"></i>
+                </button>
+            </div>
+        </div>
+        <div class="modal-body">
+            <!-- Navigation Sidebar -->
+            <nav class="settings-nav" role="navigation" aria-label="Settings sections">
+                <ul class="settings-nav-list">
+                    <li class="settings-nav-group">
+                        <button type="button" class="settings-nav-item active" data-section="general">{{ t('settings.nav.general') }}</button>
+                        <button type="button" class="settings-nav-item" data-section="interface">{{ t('settings.nav.interface') }}</button>
+                        <button type="button" class="settings-nav-item" data-section="library">{{ t('settings.nav.library') }}</button>
+                    </li>
+                </ul>
+            </nav>
+
+            <!-- Content Area -->
+            <div class="settings-content">
+                <div class="settings-form">
+                    {% include 'components/modals/settings/general.html' %}
+                    {% include 'components/modals/settings/interface.html' %}
+                    {% include 'components/modals/settings/library.html' %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Provider presets + model lists for frontend -->
+        <script id="llmProviderPresets" type="application/json">
+            {{ provider_presets_json | safe }}
+        </script>
+        <script id="llmProviderModels" type="application/json">
+            {{ provider_models_json | safe }}
+        </script>
+    </div>
+</div>
