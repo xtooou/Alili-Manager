@@ -1,0 +1,8 @@
+把你自己准备的截图放进这个 images/ 文件夹，文件名对应 README「图片展示」一节里的占位即可自动生效：
+
+- preview-manager.png       后台管理页
+- preview-card.png          模型卡片 / 元数据
+- preview-samples.png       样本库
+- preview-linkage.png       网页⇄节点联动
+
+（图标 svg 与 Generic.jpg 已在此目录，截图建议另用上面的文件名。）

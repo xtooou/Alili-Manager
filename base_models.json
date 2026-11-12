@@ -1,0 +1,23 @@
+[
+  { "name": "Anima",           "family": "Anima",          "badge": "ANIMA" },
+  { "name": "ERNIE",           "family": "ERNIE",          "badge": "ERNIE" },
+  { "name": "Flux.1 D",        "family": "Flux",           "badge": "FLUX" },
+  { "name": "Flux.1 S",        "family": "Flux",           "badge": "FLUX" },
+  { "name": "Flux.2 D",        "family": "Flux2",          "badge": "FLUX2" },
+  { "name": "Flux.2 Klein 4B", "family": "Klein-4B",       "badge": "KLEIN" },
+  { "name": "Flux.2 Klein 9B", "family": "Klein-9B",       "badge": "KLEIN" },
+  { "name": "Krea 2",          "family": "Krea2",          "badge": "KREA2" },
+  { "name": "MiniMax H3",      "family": "MiniMax-H3",     "badge": "MINIMAX" },
+  { "name": "MiniMax Music 3", "family": "",               "badge": "MINIMAX" },
+  { "name": "Muse Image",      "family": "",               "badge": "MUSE" },
+  { "name": "Qwen",            "family": "Qwen",           "badge": "QWEN" },
+  { "name": "Qwen2.1",         "family": "Qwen2.1",        "badge": "QWEN2.1" },
+  { "name": "Qwen 3",          "family": "",               "badge": "QWEN 3" },
+  { "name": "Reve",            "family": "",               "badge": "REVE" },
+  { "name": "SDXL 1.0",        "family": "SDXL",           "badge": "SDXL" },
+  { "name": "Sonilo",          "family": "",               "badge": "SONILO" },
+  { "name": "Wan Video 3.0",   "family": "",               "badge": "WAN" },
+  { "name": "ZImageTurbo",     "family": "Z-Image",        "badge": "Z-IMAGE" },
+  { "name": "ZImageBase",      "family": "Z-Image",        "badge": "Z-IMAGE" },
+  { "name": "Moss",            "family": "moss",           "badge": "MOSS" }  
+]

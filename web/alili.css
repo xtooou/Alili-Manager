@@ -1,0 +1,442 @@
+/* Alili-Manager 全局样式：后台网页 + 画布节点共用。改 :root 里的变量即可全局生效
+   动效原则：只动画 transform / opacity（走 GPU 合成，不卡），卡片上不用 backdrop-filter */
+
+/* 配色：深灰蓝 + 一个青蓝强调色（和 Alili 工作台节点同一风格）。整套只用一个强调色（--ali-accent），要换色只改这里 */
+:root {
+  --ali-font: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --ali-fs-xs: 11px; --ali-fs-sm: 12.5px; --ali-fs-md: 14px; --ali-fs-lg: 18px;
+  --ali-bg-grad: linear-gradient(180deg, #1c2027 0%, #181b21 100%);
+  --ali-bg: #1c2027; --ali-bg-2: #252a33;
+  --ali-panel: rgba(255, 255, 255, .035);
+  --ali-glass: rgba(255, 255, 255, .055); --ali-glass-hi: #262b34;
+  --ali-line: rgba(255, 255, 255, .09); --ali-line-hi: rgba(255, 255, 255, .18);
+  --ali-text: #e6e9ee; --ali-text-2: #a7afbb; --ali-text-3: #707988;
+  --ali-accent: #5aa9d6; --ali-accent-2: #4a98c5; --ali-gold: #e2b455; --ali-violet: #8aa0e0;
+  /* ★ 三个分类的主题色：大模型 / LoRA / 样本。改这里就能同时改「TAB 按钮底色、节点标签按钮底色、卡片选中边框」 */
+  --ali-model: #1f86b8; --ali-lora: #ff8a9a; --ali-sample: #ffb800;
+  --ali-on-model: #ffffff; --ali-on-lora: #3a0f18; --ali-on-sample: #3a2800;   /* 各主题色底上的文字颜色 */
+  --ali-sel-w: 2px;                                  /* 卡片「选中」边框粗细（鼠标悬停固定 1px） */
+  --ali-cur: var(--ali-accent); --ali-cur-on: var(--ali-on-accent);   /* 当前分类色：下面按 data-tab / data-kind 自动切换 */
+  --ali-n-btn-h: 30px; --ali-n-chip-h: 24px; --ali-n-gap: 6px;   /* 节点顶部：TAB / 搜索按钮高度、标签高度、两行间距 */
+  --ali-n-search-w: 150px;                           /* 节点里搜索框最大宽度（空间不够会自动缩短） */
+  --ali-n-offset: 10px;                              /* 节点：标题栏到控件带起点的空隙，用来让控件上下居中 */
+  --ali-on-accent: #0c2230; --ali-ink: rgba(255, 255, 255, .055); --ali-aurora: 0; --ali-shade: rgba(10, 12, 16, .88);
+  --ali-radius: 10px;   /* ★ 全局圆角：所有按钮 / 卡片 / 输入框 / 弹窗 / 标签 / 开关都用它，只改这一个数 */
+  --ali-r-xs: var(--ali-radius); --ali-r-sm: var(--ali-radius); --ali-r-md: var(--ali-radius); --ali-r-lg: var(--ali-radius); --ali-r-pill: var(--ali-radius);
+  --ali-ease: cubic-bezier(.22, 1, .36, 1); --ali-spring: cubic-bezier(.22, 1, .36, 1);
+  --ali-fast: .15s; --ali-mid: .25s; --ali-slow: .4s;
+  --ali-shadow: 0 12px 32px rgba(0, 0, 0, .4);
+  --ali-glow: none;   /* 聚焦只换边框颜色，不再叠一圈光晕 */
+  --ali-card-px: 8px; --ali-card-py: 6px; --ali-card-ico: 20px;   /* 卡片内容离左右 / 上下边线的距离；顶部小图标（星标、更新箭头）尺寸。想再贴就再调小 */
+  --ali-card-w: 208px; --ali-card-ratio: 137%; --ali-side-w: 280px;
+}
+:root[data-theme="light"] {
+  --ali-bg-grad: linear-gradient(180deg, #f4f6f9 0%, #edf0f4 100%);
+  --ali-bg: #f4f6f9; --ali-bg-2: #ffffff;
+  --ali-panel: rgba(255, 255, 255, .8);
+  --ali-glass: rgba(255, 255, 255, .9); --ali-glass-hi: #ffffff;
+  --ali-line: rgba(30, 55, 85, .12); --ali-line-hi: rgba(30, 55, 85, .26);
+  --ali-text: #1e2633; --ali-text-2: #566074; --ali-text-3: #8a93a3;
+  --ali-accent: #1f86b8; --ali-accent-2: #1a76a3; --ali-gold: #c98a10; --ali-violet: #5a6fc4;
+  --ali-on-accent: #ffffff; --ali-ink: rgba(30, 55, 85, .06); --ali-aurora: 0;
+  --ali-shadow: 0 10px 28px rgba(30, 55, 85, .16);
+}
+
+/* 当前分类色：后台页面是 body[data-tab]，节点面板是 .ali-root[data-tab]，弹窗 / 面板是 [data-kind] */
+[data-tab="model"], [data-kind="model"] { --ali-cur: var(--ali-model); --ali-cur-on: var(--ali-on-model); }
+[data-tab="lora"], [data-kind="lora"] { --ali-cur: var(--ali-lora); --ali-cur-on: var(--ali-on-lora); }
+[data-tab="sample"], [data-kind="sample"] { --ali-cur: var(--ali-sample); --ali-cur-on: var(--ali-on-sample); }
+
+.ali-root, .ali-root * { box-sizing: border-box; }
+.ali-root { margin: 0; min-height: 100vh; color: var(--ali-text); font: var(--ali-fs-md)/1.5 var(--ali-font); background: var(--ali-bg-grad); }
+.ali-root button, .ali-root input, .ali-root select, .ali-root textarea { font: inherit; color: inherit; }
+.ali-root ::-webkit-scrollbar { width: 10px; height: 10px; }
+.ali-root ::-webkit-scrollbar-thumb { background: var(--ali-line-hi); border-radius: var(--ali-r-pill); border: 2px solid transparent; background-clip: content-box; }
+.ali-theming, .ali-theming * { transition: background-color .45s, color .45s, border-color .45s !important; }
+
+/* 极光漂移背景已取消：背景是纯色，不再有动效 */
+.ali-aurora { display: none; }
+
+/* ── 页面骨架：左右两块圆角玻璃面板，悬浮在渐变背景上 ── */
+.ali-app { position: relative; z-index: 1; display: grid; grid-template-columns: var(--ali-side-w) 1fr; gap: 14px; height: 100vh; padding: 14px; }
+.ali-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--ali-panel); border: 1px solid var(--ali-line); border-radius: var(--ali-r-lg); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), var(--ali-shadow); }
+.ali-brand { display: flex; align-items: center; gap: 14px; padding: 22px 22px 8px; }
+.ali-logo { width: 44px; height: 44px; flex: none; object-fit: contain; transition: transform var(--ali-slow) var(--ali-spring); }
+.ali-brand:hover .ali-logo { transform: rotate(-10deg) scale(1.1); }
+.ali-title { margin: 0; font-size: 20px; font-weight: 800; letter-spacing: .5px; line-height: 1.2; }
+.ali-sub { margin: 0; font-size: var(--ali-fs-sm); color: var(--ali-text-2); }
+.ali-spacer { flex: 1; }
+.ali-main-head { display: flex; align-items: center; justify-content: flex-end; padding: 10px 20px; border-bottom: 1px solid var(--ali-line); }
+.ali-head-act { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* ── 图标：用 mask 着色，跟随文字颜色和明暗主题 ── */
+.ali-ico { display: inline-block; flex: none; width: 1.15em; height: 1.15em; background: currentColor; -webkit-mask: var(--ico) center / contain no-repeat; mask: var(--ico) center / contain no-repeat; }
+.ali-ico-fb { line-height: 1; }
+
+/* ── 标签页：滑动的胶囊指示器 ── */
+.ali-tabs { position: relative; display: flex; gap: 2px; padding: 4px; margin: 10px 18px 6px; border-radius: var(--ali-r-pill); background: var(--ali-ink); border: 1px solid var(--ali-line); }
+.ali-tabs .ali-tab { flex: 1; padding: 9px 4px; white-space: nowrap; }
+.ali-pill {
+  position: absolute; left: 0; top: 4px; bottom: 4px; border-radius: var(--ali-r-pill); opacity: 0; background: var(--ali-cur);
+  transition: transform .3s var(--ali-ease), width .3s var(--ali-ease), opacity .2s, background-color .3s;
+}
+.ali-pill.is-on { opacity: 1; }
+.ali-tab { position: relative; z-index: 1; padding: 8px 20px; border: 0; border-radius: var(--ali-r-pill); background: transparent; color: var(--ali-text-2); cursor: pointer; transition: color var(--ali-mid) var(--ali-ease); }
+.ali-tab:hover { color: var(--ali-text); }
+.ali-tab[aria-selected="true"] { color: var(--ali-cur-on); font-weight: 700; }
+
+/* ── 通用控件 ── */
+.ali-btn {
+  position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; cursor: pointer;
+  background: var(--ali-glass); border: 1px solid var(--ali-line); border-radius: var(--ali-r-sm);
+  transition: transform var(--ali-mid) var(--ali-spring), box-shadow var(--ali-mid), border-color var(--ali-fast), color var(--ali-fast), background-color var(--ali-fast);
+}
+.ali-btn:hover { border-color: var(--ali-cur); }
+.ali-btn:active { background: var(--ali-ink); }
+.ali-btn.is-on { color: var(--ali-cur); border-color: var(--ali-cur); background: color-mix(in srgb, var(--ali-cur) 14%, transparent); }
+.ali-btn:disabled { opacity: .5; pointer-events: none; }
+.ali-btn.is-danger { color: #ff8a98; border-color: rgba(255, 90, 110, .5); }
+.ali-icon-btn { width: 40px; height: 40px; padding: 0; justify-content: center; border-radius: var(--ali-radius); }
+.ali-icon-btn .ali-ico { width: 22px; height: 22px; }
+.ali-icon-btn .ali-ico-fb { font-size: 20px; }
+.ali-input { width: 240px; padding: 9px 16px; outline: 0; background: var(--ali-ink); border: 1px solid var(--ali-line); border-radius: var(--ali-r-pill); transition: border-color var(--ali-fast), box-shadow var(--ali-mid); }
+.ali-input::placeholder { color: var(--ali-text-3); }
+.ali-input:focus { width: 300px; border-color: var(--ali-cur); box-shadow: var(--ali-glow); }
+.ali-badge { display: inline-block; padding: 2px 9px; font-size: var(--ali-fs-xs); font-weight: 700; border-radius: var(--ali-r-xs); background: rgba(10, 12, 19, .72); border: 1px solid var(--ali-line-hi); color: #f4f6fb; }
+.ali-badge.is-accent { color: var(--ali-cur); border-color: color-mix(in srgb, var(--ali-cur) 60%, transparent); }
+
+/* 多选开关（滑块） */
+.ali-switch { padding: 0; border: 0; background: none; display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; color: var(--ali-text-2); transition: color var(--ali-fast); }
+.ali-switch i { position: relative; width: 44px; height: 24px; border-radius: var(--ali-r-pill); background: color-mix(in srgb, var(--ali-text) 20%, transparent); transition: background-color var(--ali-mid), box-shadow var(--ali-mid); }
+.ali-switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: var(--ali-radius); background: #fff; box-shadow: 0 2px 6px rgba(0, 0, 0, .3); transition: transform var(--ali-mid) var(--ali-spring), width var(--ali-fast); }
+.ali-switch:active i::after { width: 22px; }
+.ali-switch[aria-checked="true"] { color: var(--ali-text); }
+.ali-switch[aria-checked="true"] i { background: var(--ali-cur); }
+.ali-switch[aria-checked="true"] i::after { transform: translateX(20px); }
+.ali-switch[aria-checked="true"]:active i::after { transform: translateX(16px); }
+
+/* ── 左侧目录 ── */
+.ali-side { padding: 0; }
+.ali-tree-wrap { flex: 1; min-height: 0; overflow: auto; padding: 10px 18px; }
+.ali-tree { list-style: none; margin: 0; padding: 0; }
+.ali-tree li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; margin-bottom: 8px; border-radius: var(--ali-r-sm); border: 1px solid transparent; color: var(--ali-text-2); cursor: pointer; transition: background-color var(--ali-mid), color var(--ali-fast), border-color var(--ali-mid), transform var(--ali-mid) var(--ali-ease); }
+.ali-tree li:hover { background: var(--ali-glass); color: var(--ali-text); }
+.ali-tree li.is-drop { color: var(--ali-text); background: color-mix(in srgb, var(--ali-cur) 24%, transparent); border-color: var(--ali-cur); }   /* 拖着卡片悬停在文件夹上：只有一层边框 */
+.ali-tree li[aria-current="true"] { background: var(--ali-glass); color: var(--ali-text); font-weight: 700; border-color: var(--ali-line-hi); }
+.ali-side-foot { padding: 12px 18px 18px; }
+.ali-side-foot .ali-addcat { width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px; cursor: pointer; font: inherit; color: var(--ali-cur); background: transparent; border: 1px dashed var(--ali-cur); border-radius: var(--ali-radius); transition: background-color var(--ali-fast); }
+.ali-side-foot .ali-addcat:hover { background: color-mix(in srgb, var(--ali-cur) 12%, transparent); }
+.ali-side-foot .ali-addcat i { width: 6px; height: 6px; background: currentColor; border-radius: var(--ali-radius); }
+.ali-side-foot .ali-cat-input, .ali-tree .ali-cat-input { width: 100%; }
+.ali-tree .ali-cat-input { padding: 2px 8px; }
+.ali-tree small { min-width: 28px; padding: 1px 9px; text-align: center; border-radius: var(--ali-r-pill); background: rgba(0, 0, 0, .26); color: var(--ali-text); font-size: var(--ali-fs-xs); font-weight: 700; }
+:root[data-theme="light"] .ali-tree small { background: rgba(30, 55, 85, .12); }
+
+/* ── 主区 ── */
+.ali-main { padding: 0; }
+.ali-toolbar { display: flex; align-items: center; gap: 10px; padding: 14px 20px 8px; flex-wrap: wrap; }
+.ali-toolbar .ali-input, .ali-toolbar .ali-input:focus { flex: 0 1 320px; width: auto; min-width: 140px; margin-left: auto; }   /* 搜索框固定在这一行最右边 */
+.ali-filters { display: flex; gap: 8px; padding: 2px 20px 12px; flex-wrap: wrap; }
+.ali-chip { padding: 5px 14px; font-size: var(--ali-fs-sm); cursor: pointer; border-radius: var(--ali-r-pill); background: transparent; border: 1px solid var(--ali-line); color: var(--ali-text-2); transition: transform var(--ali-mid) var(--ali-spring), background-color var(--ali-mid), color var(--ali-fast), border-color var(--ali-fast); }
+.ali-chip:hover { color: var(--ali-text); border-color: var(--ali-line-hi); }
+.ali-chip:active { background: var(--ali-ink); }
+.is-sorting { position: relative; z-index: 6; opacity: .85; pointer-events: none; transition: none !important; }
+.ali-tree li.ins-b { box-shadow: inset 0 2px 0 var(--ali-cur); }
+.ali-tree li.ins-a { box-shadow: inset 0 -2px 0 var(--ali-cur); }
+.ali-chip.ins-b { box-shadow: inset 2px 0 0 var(--ali-cur); }
+.ali-chip.ins-a { box-shadow: inset -2px 0 0 var(--ali-cur); }
+.ali-chip.is-drop { color: var(--ali-text); border-color: var(--ali-cur); background: color-mix(in srgb, var(--ali-cur) 24%, transparent); }   /* 拖着样本卡片悬停在分类标签上 */
+.ali-chip[aria-pressed="true"] { color: var(--ali-cur-on); font-weight: 700; background: var(--ali-cur); border-color: transparent; }
+
+/* ── 卡片网格：自动换行；高度用 padding 百分比撑开，行高不会被压缩 ── */
+.ali-grid { position: relative; display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--ali-card-w), 1fr)); gap: 22px; padding: 14px 22px 40px; overflow: auto; align-content: start; flex: 1; min-height: 0; }
+.ali-grid:empty { flex: 0 0 0; padding: 0; }
+.ali-card {
+  position: relative; height: 0; padding-bottom: var(--ali-card-ratio); border-radius: var(--ali-r-md); isolation: isolate; cursor: pointer;
+  color: #fff; user-select: none; -webkit-user-select: none;
+  transition: translate var(--ali-mid) var(--ali-ease), scale var(--ali-mid) var(--ali-ease), opacity var(--ali-mid);
+}
+.ali-card-in { position: absolute; inset: 0; z-index: 1; overflow: hidden; border-radius: inherit; background: var(--ali-bg-2); border: 1px solid var(--ali-line-hi); box-shadow: 0 4px 12px rgba(0, 0, 0, .25); transition: border-color var(--ali-fast), box-shadow var(--ali-fast); }
+.ali-card:hover .ali-card-in { border-color: var(--ali-cur); }
+.ali-card[data-on="true"] .ali-card-in { border-color: var(--ali-cur); box-shadow: 0 0 0 calc(var(--ali-sel-w) - 1px) var(--ali-cur), 0 4px 12px rgba(0, 0, 0, .25); }
+.ali-cover { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: filter var(--ali-mid); }
+.ali-card-in::before { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: linear-gradient(180deg, transparent 36%, var(--ali-shade) 100%); }
+.ali-glare { display: none; }
+/* 顶部：半透明渐变罩子（和底部一样融进封面），内容贴着顶边；标签居中、点它 = 编辑；左边收藏星标，右边「有新版本」箭头。
+   注意：.ali-root button 会把 color / font 重置成 inherit，所以这里的选择器要多带一级 .ali-card 才压得过它 */
+.ali-card-top {
+  position: absolute; z-index: 3; inset: 0 0 auto; min-width: 0; min-height: 44px; padding: var(--ali-card-py) var(--ali-card-px) 0;
+  display: grid; grid-template-columns: var(--ali-card-ico) minmax(0, 1fr) var(--ali-card-ico); align-items: start; gap: 6px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--ali-shade) 82%, transparent) 0%, transparent 100%);
+}
+.ali-card .ali-card-l, .ali-card .ali-card-r { display: flex; align-items: center; min-width: 0; }
+.ali-card .ali-card-r { justify-content: flex-end; }
+.ali-card .ali-card-tag {
+  justify-self: center; min-width: 0; max-width: 100%; margin: 0; padding: 0; border: 0; background: none; text-align: center;
+  font-size: var(--ali-fs-sm); font-weight: 800; line-height: var(--ali-card-ico); letter-spacing: .02em; color: var(--ali-cur); text-shadow: 0 1px 6px rgba(0, 0, 0, .85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ali-card .ali-card-tag.is-btn { cursor: pointer; transition: filter var(--ali-fast); }
+.ali-card .ali-card-tag.is-btn:hover { filter: brightness(1.3); text-decoration: underline; text-underline-offset: 4px; }
+.ali-card .ali-upd { width: var(--ali-card-ico); height: var(--ali-card-ico); display: grid; place-items: center; font-style: normal; color: var(--ali-cur-on); background: var(--ali-cur); border-radius: var(--ali-radius); box-shadow: 0 2px 8px rgba(0, 0, 0, .35); }
+.ali-card .ali-upd svg { width: 12px; height: 12px; }
+.ali-card .ali-ib {
+  width: var(--ali-card-ico); height: var(--ali-card-ico); padding: 0; display: grid; place-items: center; cursor: pointer; font-size: 12px; color: #fff;
+  border: 1px solid rgba(255, 255, 255, .2); border-radius: var(--ali-radius); background: rgba(14, 17, 22, .7);
+  opacity: 0; transition: opacity var(--ali-fast), background-color var(--ali-fast), color var(--ali-fast);
+}
+.ali-card:hover .ali-ib, .ali-card .ali-ib.is-on { opacity: 1; }
+.ali-card .ali-ib:hover { background: var(--ali-cur); color: var(--ali-cur-on); }
+.ali-card .ali-ib.is-on { color: var(--ali-gold); }
+.ali-card .ali-ib.is-on:hover { color: var(--ali-cur-on); }
+/* 底部：全部靠左，贴着底边和左右边线，行与行之间只留 4px；文件名自动换行（下划线连着的长名字也会断开），最多 3 行 */
+.ali-card-info { position: absolute; z-index: 3; inset: auto var(--ali-card-px) var(--ali-card-py); display: grid; gap: 4px; text-align: left; }
+.ali-card-name { margin: 0; font-size: var(--ali-fs-md); font-weight: 700; line-height: 1.25; text-align: left; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; text-shadow: 0 2px 8px rgba(0, 0, 0, .7); }
+.ali-card-meta { display: flex; gap: 6px; min-width: 0; }
+.ali-card-meta .ali-badge { width: fit-content; max-width: 100%; padding: 0 7px; font-size: 11px; line-height: 17px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 框选：被选中的卡片 = 分类色边框 + 一层淡色罩；Ctrl 拖出的选框；拖拽时的文件夹落点和数量角标 */
+.ali-card[data-sel="true"] .ali-card-in { border-color: var(--ali-cur); box-shadow: 0 0 0 calc(var(--ali-sel-w) - 1px) var(--ali-cur), 0 4px 12px rgba(0, 0, 0, .25); }
+.ali-card[data-sel="true"] .ali-card-in::after { content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none; background: color-mix(in srgb, var(--ali-cur) 22%, transparent); }
+.ali-grid.is-banding { user-select: none; }
+.ali-band { position: fixed; z-index: 800; pointer-events: none; border: 1px solid var(--ali-cur); border-radius: var(--ali-radius); background: color-mix(in srgb, var(--ali-cur) 16%, transparent); }
+.ali-grid.is-multi .ali-card[data-sel="true"]:not(.is-dragging) { opacity: .45; }
+.ali-card.is-dragging[data-count]::after { content: attr(data-count); position: absolute; z-index: 5; top: 8px; right: 8px; min-width: 24px; padding: 0 7px; line-height: 24px; text-align: center; font-weight: 800; font-size: 13px; color: var(--ali-cur-on); background: var(--ali-cur); border-radius: var(--ali-radius); box-shadow: 0 2px 8px rgba(0, 0, 0, .4); }
+.ali-sel-tip { font-size: var(--ali-fs-sm); color: var(--ali-text-2); white-space: nowrap; }
+.ali-card.is-off .ali-cover { filter: grayscale(.85) brightness(.72); }
+
+/* 拖拽排序 */
+.ali-card.is-dragging { z-index: 20; cursor: grabbing; scale: 1.05; transition: scale var(--ali-mid) var(--ali-spring); }
+.ali-card.is-dragging .ali-card-in { box-shadow: 0 28px 56px rgba(0, 0, 0, .6); }
+.ali-grid.is-sorting .ali-card:not(.is-dragging) { cursor: grabbing; }
+
+/* 列表动画：进场错落、换位平滑（FLIP）、离场淡出 */
+.ali-flip-enter-from { opacity: 0; transform: perspective(900px) translateY(26px) scale(.94); }
+.ali-flip-enter-active { transition: opacity .6s var(--ali-ease), transform .7s var(--ali-ease); transition-delay: calc(min(var(--i, 0), 14) * 28ms); }
+.ali-flip-leave-active { transition: opacity .22s, transform .22s var(--ali-ease); z-index: 0; }
+.ali-flip-leave-to { opacity: 0; transform: scale(.9); }
+.ali-flip-move { transition: transform .6s var(--ali-ease); }
+
+/* 卡片底部控件：LoRA 权重 / 大模型数据类型 */
+.ali-step { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 0; background: none; border: 0; }
+.ali-step button { flex: none; width: 20px; height: 20px; padding: 0; font-size: 13px; line-height: 1; border: 0; border-radius: var(--ali-radius); background: transparent; cursor: pointer; color: #c4cbe0; transition: background-color var(--ali-fast), color var(--ali-fast), transform var(--ali-mid) var(--ali-spring); }
+.ali-step button:hover { background: var(--ali-cur); color: var(--ali-cur-on); transform: scale(1.12); }
+.ali-step button:active { transform: scale(.88); }
+.ali-step input { flex: 0 0 auto; width: 54px; min-width: 0; height: 20px; padding: 0; font-size: 12px; text-align: center; outline: 0; font-weight: 700; font-variant-numeric: tabular-nums; color: #f4f6fb; background: rgba(10, 12, 19, .74); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-radius); transition: border-color var(--ali-fast); }
+.ali-step input:focus { border-color: var(--ali-cur); }
+.ali-select { width: 100%; height: 22px; padding: 0 8px; font-size: 12px; text-align: left; cursor: pointer; outline: 0; appearance: none; font-weight: 700; color: #f4f6fb; background: rgba(10, 12, 19, .74); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-pill); transition: border-color var(--ali-fast); }
+.ali-select:hover, .ali-select:focus { border-color: var(--ali-cur); }
+.ali-select option { background: #1d2130; color: #f4f6fb; }
+
+/* ── 右键菜单 / 弹窗 / 提示：出现时带一点回弹 ── */
+.ali-menu { position: fixed; z-index: 1000; min-width: 188px; padding: 6px; display: none; font: var(--ali-fs-md)/1.5 var(--ali-font); color: var(--ali-text); background: var(--ali-glass-hi); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-md); box-shadow: var(--ali-shadow); transform-origin: top left; }
+.ali-menu.is-open { display: block; animation: ali-pop .38s var(--ali-spring); }
+.ali-menu button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 12px; border: 0; cursor: pointer; text-align: left; border-radius: var(--ali-r-sm); background: transparent; color: inherit; font: inherit; transition: background-color var(--ali-fast), transform var(--ali-mid) var(--ali-ease); }
+.ali-menu button:hover { background: color-mix(in srgb, var(--ali-cur) 22%, transparent); transform: translateX(3px); }
+.ali-menu button.is-danger:hover { background: rgba(255, 70, 90, .24); color: #ff8a98; }
+.ali-menu button.is-todo { opacity: .45; }
+.ali-menu hr { height: 1px; margin: 5px 6px; border: 0; background: var(--ali-line); }
+@keyframes ali-pop { from { opacity: 0; transform: scale(.88) translateY(-6px); } }
+
+.ali-mask { position: fixed; inset: 0; z-index: 900; display: none; place-items: center; padding: 20px; background: rgba(8, 10, 16, .55); font: var(--ali-fs-md)/1.5 var(--ali-font); color: var(--ali-text); }
+.ali-mask.is-open { display: grid; animation: ali-fade .3s ease; }
+@keyframes ali-spin { to { rotate: 360deg; } }
+@keyframes ali-fade { from { opacity: 0; } }
+.ali-modal { width: min(680px, 100%); max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; background: var(--ali-glass-hi); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-lg); box-shadow: var(--ali-shadow); animation: ali-rise .55s var(--ali-spring); }
+@keyframes ali-rise { from { opacity: 0; transform: translateY(26px) scale(.94); } }
+.ali-modal button, .ali-modal input, .ali-modal textarea { font: inherit; color: inherit; }
+.ali-modal-head { display: flex; align-items: flex-start; gap: 12px; padding: 22px 24px 14px; border-bottom: 1px solid var(--ali-line); }
+.ali-modal-title { margin: 0; font-size: var(--ali-fs-lg); font-weight: 700; line-height: 1.35; word-break: break-word; }
+.ali-modal-body { display: grid; gap: 14px; padding: 18px 24px; overflow: auto; }
+.ali-modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 24px 20px; border-top: 1px solid var(--ali-line); }
+.ali-close { margin-left: auto; width: 32px; height: 32px; border: 0; border-radius: var(--ali-radius); cursor: pointer; background: var(--ali-ink); color: var(--ali-text-2); transition: background-color var(--ali-fast), color var(--ali-fast), transform var(--ali-mid) var(--ali-spring); }
+.ali-close:hover { background: var(--ali-cur); color: var(--ali-cur-on); transform: rotate(90deg); }
+.ali-row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+/* 可编辑字段：显示态 ⇄ 编辑态 */
+.ali-field { padding: 14px 16px; border: 1px solid var(--ali-line); border-radius: var(--ali-r-md); background: var(--ali-ink); transition: border-color var(--ali-mid), box-shadow var(--ali-mid); }
+.ali-field-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: var(--ali-text-2); font-size: var(--ali-fs-sm); }
+.ali-field-act { display: flex; align-items: center; gap: 6px; }
+.ali-val { min-height: 26px; word-break: break-all; }
+.ali-val.is-muted, .is-muted { color: var(--ali-text-3); }
+.ali-hint { margin: 6px 0 0; color: var(--ali-text-3); font-size: var(--ali-fs-xs); }
+.ali-edit-input { display: none; width: 100%; padding: 8px 12px; outline: 0; resize: vertical; background: var(--ali-bg-2); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-sm); }
+.ali-edit-input:focus { border-color: var(--ali-cur); }
+.is-editing .ali-val { display: none; }
+.is-editing .ali-edit-input { display: block; animation: ali-fade .25s ease; }
+.ali-pen { width: 30px; height: 30px; padding: 0; display: grid; place-items: center; border: 0; border-radius: var(--ali-radius); cursor: pointer; background: transparent; color: var(--ali-text-2); font-size: 15px; transition: background-color var(--ali-fast), color var(--ali-fast), transform var(--ali-mid) var(--ali-spring); }
+.ali-pen:hover, .is-editing .ali-pen { background: color-mix(in srgb, var(--ali-cur) 22%, transparent); color: var(--ali-cur); transform: scale(1.1) rotate(-8deg); }
+.ali-field.is-readonly .ali-pen { display: none; }
+.ali-status { font-size: var(--ali-fs-xs); padding: 2px 9px; border-radius: var(--ali-r-pill); color: var(--ali-text-2); border: 1px solid var(--ali-line-hi); }
+.ali-status.is-new { color: var(--ali-cur-on); background: var(--ali-cur); border-color: transparent; }
+.ali-link { border: 0; background: transparent; cursor: pointer; color: var(--ali-cur); font-size: var(--ali-fs-sm); }
+.ali-link:hover { text-decoration: underline; }
+.ali-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+.ali-tag { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; cursor: pointer; color: color-mix(in srgb, var(--ali-violet) 85%, var(--ali-text)); background: color-mix(in srgb, var(--ali-violet) 10%, transparent); border: 1px solid color-mix(in srgb, var(--ali-violet) 40%, transparent); border-radius: var(--ali-r-sm); transition: background-color var(--ali-fast), transform var(--ali-mid) var(--ali-spring); }
+.ali-tag:hover { background: color-mix(in srgb, var(--ali-violet) 22%, transparent); transform: translateY(-2px); }
+.ali-tag:active { transform: scale(.95); }
+.ali-tag svg { width: 14px; height: 14px; opacity: .7; }
+
+/* 基础模型下拉 */
+.ali-picker { position: relative; }
+.ali-picker-list { position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 6px); max-height: 240px; overflow: auto; padding: 6px; background: var(--ali-bg-2); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-sm); box-shadow: var(--ali-shadow); animation: ali-pop .3s var(--ali-spring); transform-origin: top; }
+.ali-picker-list button { display: flex; justify-content: space-between; width: 100%; padding: 8px 10px; border: 0; border-radius: var(--ali-r-xs); background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.ali-picker-list button:hover, .ali-picker-list button.is-cur { background: color-mix(in srgb, var(--ali-cur) 20%, transparent); }
+.ali-picker-list small { color: var(--ali-text-3); }
+
+/* 提示条 / 确认框 / 输出图选择 */
+.ali-toasts { position: fixed; z-index: 2000; left: 50%; bottom: 28px; transform: translateX(-50%); display: grid; gap: 8px; justify-items: center; pointer-events: none; }
+.ali-toast { padding: 10px 20px; border-radius: var(--ali-r-pill); font: var(--ali-fs-md)/1.4 var(--ali-font); color: var(--ali-text); background: var(--ali-glass-hi); border: 1px solid var(--ali-line-hi); box-shadow: var(--ali-shadow); animation: ali-rise .5s var(--ali-spring); }
+.ali-toast.is-ok { border-color: var(--ali-cur); }
+.ali-toast.is-err { border-color: #ff5a6e; color: #ff8a98; }
+.ali-confirm { width: min(440px, 100%); }
+.ali-confirm p { margin: 0; padding: 18px 24px; white-space: pre-line; color: var(--ali-text-2); }
+.ali-pick-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; padding: 18px 24px 24px; overflow: auto; }
+.ali-pick-grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: var(--ali-r-sm); cursor: pointer; border: 2px solid transparent; transition: border-color var(--ali-fast), transform var(--ali-mid) var(--ali-spring); }
+.ali-pick-grid img:hover { border-color: var(--ali-cur); transform: scale(1.05); }
+.ali-empty { grid-column: 1 / -1; padding: 80px 0; text-align: center; color: var(--ali-text-3); }
+
+/* ── 画布节点面板 ── */
+.ali-root.ali-embed { --ali-card-w: 150px; background: transparent; pointer-events: none; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; font-size: 13px; }
+/* 节点布局：顶部是透明的「控件带」，高度固定（两行 + 下边距），卡片区顶边永远在同一个位置。
+   固定不动的：搜索框(第一行左) · 多选(第二行左) · 联动(第二行右，落在输出口标签下面的空地) · 标签筛选(第二行中间，有就显示，没有就空着)
+   唯一会动的：三个 TAB（按整个窗口水平居中）——有标签时在第一行；没有标签时向下平移半行，停在整个控件带的垂直中点
+   上下空隙：上面是 LiteGraph 自带的约 10px，下面是 --ali-n-offset，两边相等 = 上下居中，不够居中就调它 */
+.ali-n-top { flex: none; display: flex; flex-direction: column; gap: var(--ali-n-gap); padding: 0 8px var(--ali-n-offset); pointer-events: none; }
+.ali-n-top .ali-tabs, .ali-n-top .ali-switch, .ali-n-top .ali-chip, .ali-n-top .ali-input { pointer-events: auto; }
+.ali-n-head, .ali-n-bar { flex: none; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 10px; min-width: 0; }
+.ali-n-head { height: var(--ali-n-btn-h); }
+.ali-n-bar { height: var(--ali-n-chip-h); }
+.ali-n-l, .ali-n-r { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ali-n-l { justify-self: start; }
+.ali-n-r { justify-self: end; }
+.ali-n-head .ali-tabs { margin: 0; padding: 0; gap: 8px; height: var(--ali-n-btn-h); background: none; border: 0; }
+.ali-n-head .ali-pill { top: 0; bottom: 0; }
+.ali-n-head .ali-tabs { transition: transform .3s var(--ali-ease); }
+.ali-n-top.no-chips .ali-n-head .ali-tabs { transform: translateY(calc((var(--ali-n-chip-h) + var(--ali-n-gap)) / 2)); }   /* 没有标签：下移半行 = 垂直居中 */
+.ali-n-head .ali-tab { flex: none; height: var(--ali-n-btn-h); padding: 0 14px; line-height: 1; font-size: 13.5px; background: var(--ali-glass); border: 1px solid var(--ali-line); }
+.ali-n-head .ali-tab:hover { border-color: var(--ali-line-hi); }
+.ali-n-head .ali-tab[aria-selected="true"] { background: transparent; border-color: transparent; }
+.ali-n-head .ali-input, .ali-n-head .ali-input:focus { flex: 0 1 var(--ali-n-search-w); width: auto; min-width: 60px; height: var(--ali-n-btn-h); padding: 0 14px; line-height: 1.2; font-size: 13.5px; }
+.ali-n-top .ali-switch { flex: none; height: var(--ali-n-chip-h); gap: 6px; }
+.ali-n-top .ali-switch i { width: 34px; height: 18px; }
+.ali-n-top .ali-switch i::after { top: 2px; left: 2px; width: 14px; height: 14px; }
+.ali-n-top .ali-switch:active i::after { width: 17px; }
+.ali-n-top .ali-switch[aria-checked="true"] i::after { transform: translateX(16px); }
+.ali-n-top .ali-switch[aria-checked="true"]:active i::after { transform: translateX(13px); }
+.ali-n-bar .ali-filters { flex: 0 1 auto; min-width: 0; padding: 0; gap: 8px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; pointer-events: auto; }
+.ali-n-bar .ali-filters::-webkit-scrollbar { display: none; }
+.ali-n-bar .ali-chip { flex: none; height: var(--ali-n-chip-h); padding: 0 12px; line-height: 1; font-size: 12.5px; white-space: nowrap; }
+.ali-n-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; pointer-events: auto; background: var(--ali-bg); border: 1px solid var(--ali-line); border-radius: var(--ali-r-md); }
+.ali-n-grid { padding: 6px 12px 12px; gap: 12px; }
+.ali-n-grid .ali-card-name { font-size: 12.5px; }
+.ali-n-grid .ali-card .ali-card-tag { font-size: 11.5px; }
+.ali-n-empty { grid-column: 1 / -1; display: grid; gap: 12px; justify-items: center; padding: 36px 12px; color: var(--ali-text-3); text-align: center; }
+
+/* ── 响应式 / 减弱动效 ── */
+@media (max-width: 860px) {
+  .ali-app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
+  .ali-side { max-height: 46vh; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ali-root *, .ali-root *::before, .ali-root *::after, .ali-mask *, .ali-menu { animation: none !important; transition: none !important; }
+}
+.ali-root :focus-visible, .ali-mask :focus-visible, .ali-menu :focus-visible { outline: 2px solid var(--ali-cur); outline-offset: 2px; }
+:is(.ali-root, .ali-mask, .ali-menu, .ali-pop) :is(input, textarea, select):focus-visible { outline: 0; }   /* 输入框不要外圈：只靠自己的边框变色 */
+
+/* ───── 样本详情面板（点击样本卡片后，在卡片旁边弹出，没有蒙版）───── */
+.ali-status.is-ok { color: color-mix(in srgb, #4ade80 80%, var(--ali-text)); border-color: color-mix(in srgb, #4ade80 45%, transparent); }
+.ali-status.is-miss { color: color-mix(in srgb, #f87171 85%, var(--ali-text)); border-color: color-mix(in srgb, #f87171 50%, transparent); }
+.ali-pop, .ali-pop * { box-sizing: border-box; }
+.ali-pop {
+  position: fixed; z-index: 900; width: min(540px, calc(100vw - 16px)); max-height: calc(100vh - 16px); display: flex; flex-direction: column; overflow: hidden; transform-origin: top left;
+  font: var(--ali-fs-md)/1.5 var(--ali-font); color: var(--ali-text); background: var(--ali-glass-hi);
+  border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-lg); box-shadow: var(--ali-shadow); animation: ali-pop .38s var(--ali-spring);
+}
+.ali-pop button, .ali-pop input, .ali-pop textarea { font: inherit; color: inherit; }
+.ali-pop-head { flex: none; display: flex; align-items: center; gap: 12px; padding: 14px 18px 10px; }
+.ali-pop-title { flex: 1; min-width: 0; margin: 0; font-size: var(--ali-fs-lg); font-weight: 800; line-height: 1.3; color: var(--ali-cur); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ali-pop-name { flex: 1; min-width: 0; padding: 8px 12px; outline: 0; background: var(--ali-bg-2); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-sm); }
+.ali-pop-name:focus, .ali-pop-edit:focus { border-color: var(--ali-cur); }
+.ali-pop-body { display: grid; gap: 12px; padding: 4px 18px 18px; overflow: auto; }
+.ali-pop-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 30px; margin-bottom: 8px; }
+.ali-pop-label { font-weight: 700; color: var(--ali-text-2); }
+.ali-pop-acts { display: flex; gap: 8px; }
+.ali-pop .ali-btn { padding: 4px 14px; border-radius: var(--ali-radius); font-size: var(--ali-fs-sm); }
+.ali-pop .ali-btn:hover { border-color: var(--ali-cur); }
+.ali-pop .ali-btn.is-cur { font-weight: 700; color: var(--ali-cur-on); background: var(--ali-cur); border-color: transparent; }
+.ali-pop-box { max-height: 230px; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; line-height: 1.7; background: var(--ali-ink); border: 1px solid var(--ali-line); border-radius: var(--ali-r-sm); }
+.ali-pop-box.is-muted { color: var(--ali-text-3); }
+.ali-pop-edit { display: block; width: 100%; resize: vertical; outline: 0; background: var(--ali-bg-2); border-color: var(--ali-line-hi); }
+.ali-pop-info { display: grid; gap: 6px; padding-top: 12px; border-top: 1px solid var(--ali-line); }
+.ali-pop-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ali-pop-k { flex: none; width: 7.5em; color: var(--ali-text-3); }
+.ali-pop-v { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ali-text-2); }
+.ali-pop-v small { color: var(--ali-text-3); font-size: inherit; }
+.ali-pop-params { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-top: 12px; border-top: 1px solid var(--ali-line); color: var(--ali-text); font-variant-numeric: tabular-nums; }
+.ali-pop-p b { font-weight: 700; color: var(--ali-text-2); }
+
+/* 弹窗挂在 body 下，不在 .ali-root 里，需要自己带上 border-box，否则输入框会超出边界 */
+.ali-modal, .ali-modal *, .ali-mask { box-sizing: border-box; }
+
+/* ───── 进度条（拉取 CivitAI 数据 / 检查更新）：底部悬浮；颜色跟着 data-kind（大模型蓝 / LoRA 粉）；右边 n/n；运行中有 ✕ 可取消 ───── */
+.ali-prog {
+  position: fixed; z-index: 850; left: 50%; bottom: 28px; translate: -50% 0; width: min(380px, calc(100vw - 32px)); display: grid; gap: 12px; padding: 14px 16px 16px;
+  font: var(--ali-fs-md)/1.4 var(--ali-font); color: var(--ali-text); background: var(--ali-glass-hi); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-radius); box-shadow: var(--ali-shadow);
+}
+.ali-prog-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ali-prog-title { flex: 1; min-width: 0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ali-prog-n { flex: none; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--ali-cur); }
+.ali-prog .ali-prog-x { flex: none; width: 24px; height: 24px; font-size: 12px; }
+.ali-prog-ico { flex: none; width: 18px; height: 18px; display: grid; place-items: center; font-style: normal; font-size: 12px; font-weight: 800; border: 2px solid color-mix(in srgb, var(--ali-cur) 28%, transparent); border-top-color: var(--ali-cur); border-radius: var(--ali-radius); animation: ali-spin .8s linear infinite; }
+.ali-prog:not(.is-run) .ali-prog-ico { animation: none; color: var(--ali-cur-on); background: var(--ali-cur); border-color: var(--ali-cur); }
+.ali-prog-bar { height: 8px; overflow: hidden; background: var(--ali-ink); border-radius: var(--ali-radius); }
+.ali-prog-bar i { display: block; height: 100%; background: var(--ali-cur); border-radius: inherit; transition: width .25s var(--ali-ease); }
+.ali-prog-enter-active, .ali-prog-leave-active { transition: opacity .25s, translate .3s var(--ali-ease); }
+.ali-prog-enter-from, .ali-prog-leave-to { opacity: 0; translate: -50% 16px; }
+
+
+/* ───────── 弹窗：前进/后退、右侧按钮列、基础模型下拉、模型列表页 ───────── */
+.ali-nav { display: flex; gap: 2px; flex: none; margin-top: -2px; }
+.ali-nav button { width: 32px; height: 32px; padding: 0; display: grid; place-items: center; border: 0; border-radius: var(--ali-radius); background: transparent; color: var(--ali-text-2); cursor: pointer; transition: background-color var(--ali-fast), color var(--ali-fast); }
+.ali-nav button:hover:not(:disabled) { background: color-mix(in srgb, var(--ali-cur) 22%, transparent); color: var(--ali-cur); }
+.ali-nav button:disabled { opacity: .3; cursor: default; }
+.ali-field-top.is-tall { align-items: flex-start; }
+.ali-field-lead { display: flex; align-items: center; gap: 8px; min-height: 30px; }
+.ali-act-col { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.ali-link:disabled { opacity: .5; cursor: default; text-decoration: none; }
+.ali-modal .ali-btn.is-sm { padding: 3px 12px; font-size: var(--ali-fs-sm); }
+.ali-status.is-btn { cursor: pointer; font: inherit; font-size: var(--ali-fs-xs); }
+.ali-status.is-btn:hover { filter: brightness(1.1); }
+.ali-status.is-cur { color: var(--ali-cur); border-color: var(--ali-cur); }
+button.ali-upd { border: 0; padding: 0; cursor: pointer; transition: transform var(--ali-mid) var(--ali-spring); }
+button.ali-upd:hover { transform: scale(1.18); }
+
+.ali-picker-input { display: block; width: 100%; padding: 8px 64px 8px 12px; outline: 0; background: var(--ali-bg-2); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-sm); cursor: pointer; text-overflow: ellipsis; }
+.ali-picker-input:focus, .ali-picker.is-open .ali-picker-input { border-color: var(--ali-cur); cursor: text; }
+.ali-picker-end { position: absolute; right: 12px; top: 50%; translate: 0 -50%; display: flex; align-items: center; gap: 8px; pointer-events: none; color: var(--ali-text-3); }
+.ali-picker-caret { width: 7px; height: 7px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; rotate: 45deg; translate: 0 -2px; transition: rotate var(--ali-mid); }
+.ali-picker.is-open .ali-picker-caret { rotate: 225deg; translate: 0 2px; }
+
+.ali-vers { gap: 12px; }
+.ali-vers-empty { display: grid; justify-items: center; gap: 10px; padding: 28px 0; color: var(--ali-text-3); }
+.ali-vers-empty p { margin: 0; }
+.ali-ver { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 12px; border: 1px solid var(--ali-line); border-radius: var(--ali-r-md); background: var(--ali-ink); }
+.ali-ver.is-cur { border-color: var(--ali-cur); }
+.ali-ver-img { width: 72px; height: 92px; display: grid; place-items: center; overflow: hidden; border-radius: var(--ali-r-sm); background: var(--ali-bg-2); color: var(--ali-text-3); font-size: var(--ali-fs-xs); }
+.ali-ver-img img { width: 100%; height: 100%; object-fit: cover; }
+.ali-ver-main { min-width: 0; display: grid; gap: 8px; }
+.ali-ver-name { display: flex; align-items: center; gap: 6px; font-weight: 700; min-width: 0; }
+.ali-ver-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ali-ver-ext { flex: none; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: var(--ali-r-xs); background: transparent; color: var(--ali-text-3); cursor: pointer; }
+.ali-ver-ext:hover { color: var(--ali-cur); }
+.ali-ver-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.ali-ver-tags:empty { display: none; }
+.ali-ver-meta { color: var(--ali-text-3); font-size: var(--ali-fs-xs); }
+.ali-ver-act { display: grid; gap: 8px; min-width: 116px; }
+.ali-ver-act .ali-btn { padding: 7px 14px; font-size: var(--ali-fs-sm); text-align: center; white-space: nowrap; }
+.ali-ver-act .ali-btn.is-primary { color: var(--ali-cur-on); background: var(--ali-cur); border-color: transparent; font-weight: 700; }
+.ali-ver-act .ali-btn.is-primary:hover { filter: brightness(1.08); }
+@media (max-width: 560px) { .ali-ver { grid-template-columns: 56px minmax(0, 1fr); } .ali-ver-img { width: 56px; height: 72px; } .ali-ver-act { grid-column: 1 / -1; grid-template-columns: 1fr 1fr; } }
+
+/* 节点面板里的「打开后台页面」按钮（MANAGER_BTN = 'panel' 时）：贴在标签页右边 */
+.ali-n-head .ali-n-r { justify-self: start; }
+.ali-n-top .ali-n-open { pointer-events: auto; width: var(--ali-n-btn-h); height: var(--ali-n-btn-h); padding: 0; display: grid; place-items: center; }
