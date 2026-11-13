@@ -533,7 +533,7 @@ export const CardModal = defineComponent({
 
 // 样本详情面板：点击样本卡片后，在卡片旁边弹出（没有蒙版）。样本是存下来的记忆数据，所以参数只读；
 // 唯一能编辑的是名称和提示词（点「编辑」）。点 ✕ / 点面板外面 / 按 Esc 关闭。
-const PARAMS = [['seed', 'Seed(种子)'], ['steps', 'Steps(步数)'], ['cfg', 'CFG(提示词相关性)'], ['sampler', 'Sampler(采样器)'], ['scheduler', 'Scheduler(调度器)'], ['denoise', 'Denoise(重绘幅度)'], ['size', 'Size(尺寸)']];
+const PARAMS = [['seed', 'Seed'], ['steps', 'Steps'], ['cfg', 'CFG'], ['sampler', 'Sampler'], ['scheduler', 'Scheduler'], ['denoise', 'Denoise'], ['size', 'Size']];
 
 export const SamplePanel = defineComponent({
   props: { sample: Object, anchor: Object },   // anchor = 被点击卡片的 {left, top, right, bottom}
@@ -549,7 +549,7 @@ export const SamplePanel = defineComponent({
     watch(() => props.sample, () => { if (!editing.value) reset(); });
 
     // 只要文件名（view 里的 title 已经去掉了路径和扩展名）；没有记录就显示「—」
-    const rows = (list, lora) => (list.length ? list.map((x) => ({ name: x.name, title: x.title, local: x.local, w: lora ? x.strength : undefined })) : [{ title: '—', none: true }]);
+    const rows = (list, lora) => (list.length ? list.map((x) => ({ name: x.name, title: x.title, local: x.local, w: lora ? x.strength : undefined })) : [{ title: '无', none: true }]);
     const modelRows = computed(() => rows(view.value.models, false));
     const loraRows = computed(() => rows(view.value.loras, true));
     const canSend = computed(() => !!(props.sample.state && (props.sample.state.models || []).length));
