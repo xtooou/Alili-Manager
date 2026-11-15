@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模型管理器 · by 阿里里</title>
+  <link rel="icon" href="images/svg/logo.svg">
+  <link rel="stylesheet" href="alili.css">
+  <script>
+    /* 默认跟随系统明暗，手动切换后记住 */
+    (function () {
+      let t = null; try { t = localStorage.getItem('ali-theme'); } catch (e) {}
+      if (!t) t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body class="ali-root" data-tab="lora">
+  <div id="app"></div>
+  <script type="module" src="manager.js"></script>
+</body>
+</html>
