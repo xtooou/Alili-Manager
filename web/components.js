@@ -48,8 +48,8 @@ export const AliTabs = defineComponent({
 // 卡片：悬停时有跟手的 3D 倾斜 + 高光（rAF 平滑插值）；LoRA 底部权重 / 大模型底部数据类型
 export const AliCard = defineComponent({
   components: { AliIcon },
-  props: { item: Object, cover: String, video: String, allowPlay: { type: Boolean, default: true }, on: Boolean, dim: Boolean, control: String, weight: Number, dtype: String, editable: Boolean, sel: Boolean, index: { type: Number, default: 0 }, fav: { type: Boolean, default: undefined } },
-  emits: ['toggle', 'menu', 'edit', 'fav', 'weight', 'dtype', 'versions'],   // editable：顶部标签可点击 = 编辑（原来右上角的笔）
+  props: { item: Object, cover: String, video: String, allowPlay: { type: Boolean, default: true }, on: Boolean, dim: Boolean, control: String, weight: Number, steps: Number, dtype: String, editable: Boolean, sel: Boolean, index: { type: Number, default: 0 }, fav: { type: Boolean, default: undefined } },
+  emits: ['toggle', 'menu', 'edit', 'fav', 'weight', 'steps', 'dtype', 'versions'],   // editable：顶部标签可点击 = 编辑（原来右上角的笔）
   setup(props, { emit }) {
     const el = ref(null), bad = ref(''), noDefault = ref(false), vd = ref(null);
     const src = computed(() => (props.cover && bad.value !== props.cover ? props.cover : DEFAULT_COVER));
@@ -73,7 +73,17 @@ export const AliCard = defineComponent({
       const typedVal = parseFloat(e.target.value), base = isNaN(typedVal) ? props.weight : typedVal;   // 输入了还没回车的数字也算进去
       emit('weight', Math.round((base + (e.deltaY < 0 ? 0.05 : -0.05)) * 100) / 100);
     };
-    return { el, step, typed, wheel, DTYPES, src, onImgErr, noDefault, DEFAULT_COVER,
+    // 步数：整数，1~100，步进 1；滚轮 / 输入 / 按钮都走同一个 emit('steps')
+    const clampSteps = (v) => Math.max(1, Math.min(100, Math.round(v)));
+    const stepSteps = (d) => emit('steps', clampSteps((props.steps || 1) + d));
+    const typedSteps = (e) => { const v = parseInt(e.target.value, 10); if (isNaN(v)) e.target.value = String(props.steps || 1); else emit('steps', clampSteps(v)); };
+    const wheelSteps = (e) => {
+      if (document.activeElement !== e.target) return;
+      e.preventDefault(); e.stopPropagation();
+      const typedVal = parseInt(e.target.value, 10), base = isNaN(typedVal) ? (props.steps || 1) : typedVal;
+      emit('steps', clampSteps(base + (e.deltaY < 0 ? 1 : -1)));
+    };
+    return { el, step, typed, wheel, stepSteps, typedSteps, wheelSteps, DTYPES, src, onImgErr, noDefault, DEFAULT_COVER,
       vd, videoFailed, paused, showVideo, onVideoErr, togglePlay };
   },
   template: `
@@ -116,13 +126,34 @@ export const AliCard = defineComponent({
       </div>
       <div class="ali-card-info">
         <h3 class="ali-card-name" :title="item.title">{{ item.title }}</h3>
-        <div v-if="item.version" class="ali-card-meta"><span class="ali-badge">{{ item.version }}</span></div>
-        <div v-if="control === 'weight'" class="ali-step" @click.stop @pointerdown.stop>
-          <button @click="step(-0.05)">‹</button><input :value="weight.toFixed(2)" @change="typed" @wheel="wheel"><button @click="step(0.05)">›</button>
+        <div v-if="control === 'weight'" class="ali-ctl-row" @click.stop @pointerdown.stop>
+          <div class="ali-ctl">
+            <span class="ali-ctl-lab">权重</span>
+            <div class="ali-step ali-step-c">
+              <button @click="step(-0.05)" title="减小权重"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.5 2 6l4 4.5"/></svg></button><input :value="weight.toFixed(2)" @change="typed" @wheel="wheel"><button @click="step(0.05)" title="增大权重"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 1.5 6 6l-4 4.5"/></svg></button>
+            </div>
+          </div>
+          <div class="ali-ctl">
+            <span class="ali-ctl-lab">步数</span>
+            <div class="ali-step ali-step-c">
+              <button @click="stepSteps(-1)" title="减小步数"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.5 2 6l4 4.5"/></svg></button><input :value="String(steps || 1)" @change="typedSteps" @wheel="wheelSteps"><button @click="stepSteps(1)" title="增大步数"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 1.5 6 6l-4 4.5"/></svg></button>
+            </div>
+          </div>
         </div>
-        <select v-else-if="control === 'dtype'" class="ali-select" :value="dtype" @click.stop @pointerdown.stop @change="$emit('dtype', $event.target.value)">
-          <option v-for="d in DTYPES" :key="d" :value="d">{{ d }}</option>
-        </select>
+        <div v-else-if="control === 'dtype'" class="ali-ctl-row" @click.stop @pointerdown.stop>
+          <div class="ali-ctl">
+            <span class="ali-ctl-lab">精度</span>
+            <select class="ali-select" :value="dtype" @change="$emit('dtype', $event.target.value)">
+              <option v-for="d in DTYPES" :key="d" :value="d">{{ d }}</option>
+            </select>
+          </div>
+          <div class="ali-ctl">
+            <span class="ali-ctl-lab">步数</span>
+            <div class="ali-step ali-step-c">
+              <button @click="stepSteps(-1)" title="减小步数"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.5 2 6l4 4.5"/></svg></button><input :value="String(steps || 1)" @change="typedSteps" @wheel="wheelSteps"><button @click="stepSteps(1)" title="增大步数"><svg class="ali-chev" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 1.5 6 6l-4 4.5"/></svg></button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </article>`,

@@ -204,7 +204,7 @@
 .ali-card .ali-card-l, .ali-card .ali-card-r { display: flex; align-items: center; min-width: 0; }
 .ali-card .ali-card-r { justify-content: flex-end; }
 .ali-card .ali-card-tag {
-  justify-self: center; min-width: 0; max-width: 100%; margin: 0; padding: 0; border: 0; background: none; text-align: center;
+  position: absolute; top: var(--ali-card-py); left: 50%; transform: translateX(-50%); min-width: 0; max-width: calc(100% - 2 * (var(--ali-card-ico) + 6px + var(--ali-card-px))); margin: 0; padding: 0; border: 0; background: none; text-align: center;
   font-size: var(--ali-fs-sm); font-weight: 800; line-height: var(--ali-card-ico); letter-spacing: .02em; color: var(--ali-cur); text-shadow: 0 1px 6px rgba(0, 0, 0, .85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ali-card .ali-card-tag.is-btn { cursor: pointer; transition: filter var(--ali-fast); }
@@ -257,6 +257,26 @@
 .ali-select { width: 100%; height: 22px; padding: 0 8px; font-size: 12px; text-align: left; cursor: pointer; outline: 0; appearance: none; font-weight: 700; color: #f4f6fb; background: rgba(10, 12, 19, .74); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-pill); transition: border-color var(--ali-fast); }
 .ali-select:hover, .ali-select:focus { border-color: var(--ali-cur); }
 .ali-select option { background: #1d2130; color: #f4f6fb; }
+
+/* 卡片底部两栏：权重 / 精度 + 步数。方案 C：箭头半透明常驻、悬停变亮，绝对定位不占输入宽度 */
+.ali-ctl-row { display: flex; gap: 6px; }
+.ali-ctl { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ali-ctl-lab { font-size: 11px; line-height: 1; color: var(--ali-text-2); padding-left: 3px; }
+/* 精度下拉跟权重 / 步数胶囊统一高度、内边距、字号 */
+.ali-ctl .ali-select { height: 20px; padding: 0 6px; font-size: 11px; text-align: center; }
+.ali-step-c { position: relative; justify-content: center; }
+/* 数字：胶囊高 20px(border-box)，上下边框各 1px → 内容区 18px；line-height 设 18px 让数字视觉中心落在胶囊中线 y=10px */
+.ali-step-c input { flex: 1 1 0; width: 100%; min-width: 0; padding: 0 20px; line-height: 18px; }
+/* 箭头按钮：与胶囊等高 20px、top:0 贴住两端，只作为 SVG 像素定位的参考盒 */
+.ali-step-c button { position: absolute; top: 0; z-index: 1; opacity: .4; width: 20px; height: 20px; padding: 0; border: 0; background: transparent; cursor: pointer; color: #c4cbe0; }
+.ali-step-c button:first-child { left: 0; border-radius: 10px 0 0 10px; }
+.ali-step-c button:last-child { right: 0; border-radius: 0 10px 10px 0; }
+/* SVG 箭头：纯图形无基线。按钮 20px、箭头 12px → top=(20-12)/2=4px；宽 8px → left=(20-8)/2=6px；中心精确落在 y=10px，与数字共线 */
+.ali-chev { position: absolute; top: 4px; left: 6px; width: 8px; height: 12px; display: block; }
+.ali-step-c:hover button { opacity: 1; }
+.ali-step-c button:hover { background: color-mix(in srgb, var(--ali-cur) 28%, transparent); color: #fff; }
+/* 覆盖通用箭头按钮的 scale 形变，避免 hover/active 时跳动 */
+.ali-step-c button:hover, .ali-step-c button:active { transform: none; }
 
 /* ── 右键菜单 / 弹窗 / 提示：出现时带一点回弹 ── */
 .ali-menu { position: fixed; z-index: 1000; min-width: 188px; padding: 6px; display: none; font: var(--ali-fs-md)/1.5 var(--ali-font); color: var(--ali-text); background: var(--ali-glass-hi); border: 1px solid var(--ali-line-hi); border-radius: var(--ali-r-md); box-shadow: var(--ali-shadow); transform-origin: top left; }

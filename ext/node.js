@@ -159,12 +159,22 @@ async function linkModel(t) {
   else if (ok.length) toast(`已联动${fam ? '（' + fam + '）' : ''}：${ok.join('、')}`, 'ok');
 }
 
-function applySteps(picked) {  // 从 LoRA / 大模型名字里找 “4steps / 8-step”，找不到回到 20
-  const pat = /(\d{1,2})\s*[-_ ]?\s*steps?\b/i;
-  let steps = 25;
-  for (const t of picked) { const m = pat.exec(`${t.title} ${t.version} ${t.file_name}`); if (m) { steps = +m[1]; break; } }
+// 步数单一数据源：每张卡片自带 t.steps（输入框的值），采样器只读它
+// 正则只做一件事——卡片第一次选中、框还是空的时候，从名字猜一个初始值填进去；用户改过的值永不覆盖
+function detectSteps(t) {
+  const pat = /(\d{1,2})\D{0,4}steps?/i;   // 忽略任意分隔符：4_step / 4-step / 4 step / 4step 都认
+  const m = pat.exec(`${t.title || ''} ${t.version || ''} ${t.file_name || ''}`);
+  const v = m ? +m[1] : 25;
+  return v >= 1 && v <= 100 ? v : 25;      // 三位以上数字 / 离谱值一律回退 25
+}
+function writeSteps(steps) {
   live((n) => wid(n, /^(steps|步数)$/i)).forEach((n) => { const w = wid(n, /^(steps|步数)$/i); w.value = steps; w.callback?.(steps); });
   app.graph.setDirtyCanvas(true, true);
+}
+function applySteps(picked) {
+  for (const t of picked) if (t.steps == null || t.steps === '') t.steps = detectSteps(t);  // 只填空，不覆盖手改值
+  const src = picked.find((t) => t.steps != null && t.steps !== '');                          // 采样器读第一张有效卡的输入框值
+  if (src) writeSteps(+src.steps);
 }
 
 // ───────────── 每个节点一个 store ─────────────
@@ -183,7 +193,7 @@ function createStore(node, wState) {
   const payload = () => JSON.stringify({
     v: 1, tab: s.tab, multi: s.multi, link: s.link, tray: s.tray, sel: s.sel,
     models: picked('model').map((t) => ({ key: t.key, name: t.name, dtype: t.dtype || 'default' })),
-    loras: picked('lora').map((t) => ({ name: t.name, w: +t.w })),
+    loras: picked('lora').map((t) => ({ name: t.name, w: +t.w, steps: +t.steps || detectSteps(t) })),
   });
 
   let rt;
@@ -228,6 +238,7 @@ function createStore(node, wState) {
         s.tab = o.tab || 'lora'; Object.assign(s.multi, o.multi || {}); s.link = o.link !== false;
         s.tray.lora = o.tray?.lora || []; s.tray.model = o.tray?.model || [];
         s.sel.lora = o.sel?.lora || []; s.sel.model = o.sel?.model || [];
+        for (const k of ['lora', 'model']) for (const t of s.tray[k]) if (t.steps == null || t.steps === '') t.steps = detectSteps(t);  // 老工作流补初始值
       }
     } catch {}
     last = sig();  // 恢复不触发联动
@@ -238,6 +249,7 @@ function createStore(node, wState) {
     const a = s.sel[k];
     s.sel[k] = s.multi[k] ? (a.includes(id) ? a.filter((x) => x !== id) : [...a, id]) : (a.includes(id) ? [] : [id]);
   };
+  const setSteps = (t, v) => { t.steps = v; writeSteps(v); };   // 手改进度框 = 采样器立即同步（数据源就是这个框）
   const remove = (k, id) => { s.tray[k] = s.tray[k].filter((t) => t.id !== id); s.sel[k] = s.sel[k].filter((x) => x !== id); };
   const reorder = (k, shownIds) => {  // 只重排当前看得到的卡片，被筛选掉的位置不变
     const shown = new Set(shownIds); let n = 0;
@@ -303,7 +315,7 @@ function createStore(node, wState) {
     } catch (e) { toast(e.message, 'err'); }
   };
 
-  return { s, node, load, report, toggle, remove, reorder, restore, receive, syncItem, saveCover, saveSample, loadSamples, find };
+  return { s, node, load, report, toggle, setSteps, remove, reorder, restore, receive, syncItem, saveCover, saveSample, loadSamples, find };
 }
 
 // ───────────── 「打开后台页面」按钮的位置 ─────────────
@@ -339,8 +351,8 @@ const PANEL_TPL = `
   <div class="ali-n-body">
   <AliGrid v-if="s.tab !== 'sample'" :key="s.tab" class="ali-n-grid" :ids="shown.map((t) => t.id)" sortable @reorder="(ids) => reorder(s.tab, ids)">
     <AliCard v-for="(t, n) in shown" :key="t.id" :index="n" :item="t" :cover="coverUrl(t)" :on="s.sel[s.tab].includes(t.id)" :dim="!s.sel[s.tab].includes(t.id)" editable
-      :control="s.tab === 'lora' ? 'weight' : (t.key === 'checkpoints' ? '' : 'dtype')" :weight="Number(t.w ?? 1)" :dtype="t.dtype || 'default'"
-      @toggle="toggle(s.tab, t.id)" @weight="t.w = $event" @dtype="t.dtype = $event" @edit="openGear(t)" @versions="openGear(t, 'list')" @menu="openMenu($event, t)" />
+      :control="s.tab === 'lora' ? 'weight' : (t.key === 'checkpoints' ? '' : 'dtype')" :weight="Number(t.w ?? 1)" :steps="Number(t.steps ?? 0)" :dtype="t.dtype || 'default'"
+      @toggle="toggle(s.tab, t.id)" @weight="t.w = $event" @steps="setSteps(t, $event)" @dtype="t.dtype = $event" @edit="openGear(t)" @versions="openGear(t, 'list')" @menu="openMenu($event, t)" />
   </AliGrid>
   <AliGrid v-else key="sample" class="ali-n-grid" :ids="[]" sortable drag-only @drop-folder="moveSamples">
     <AliCard v-for="(x, n) in sampleShown" :key="x.id" :index="n" :item="{ id: x.id, title: x.name, badge: '样本' }" :cover="sampleCover(x)"
@@ -436,7 +448,7 @@ function mountPanel(node) {
   const vueApp = Vue.createApp({
     components: { AliCard, AliSwitch, AliMenu, CardModal, SamplePanel, ImagePicker, AliTabs, AliGrid },
     directives: { sortList: vSortList },
-    setup: () => ({ onWheel, s, TABS, shown, sampleShown, fams, chips, chipList, chipOn, isSmp, setChip, moveSamples, sortOpt, coverUrl, sampleCover, toast, toggle: store.toggle, restore: store.restore, reorder: store.reorder,
+    setup: () => ({ onWheel, s, TABS, shown, sampleShown, fams, chips, chipList, chipOn, isSmp, setChip, moveSamples, sortOpt, coverUrl, sampleCover, toast, toggle: store.toggle, setSteps: store.setSteps, restore: store.restore, reorder: store.reorder,
       openGear, openMenu, openSampleMenu, pick, onSaved, pickImg, restoreSample, popId, popSample, togglePop, onSampleSaved, sendSample, store, openManager: openManagerPage, panelBtn: MANAGER_BTN === 'panel' }),
     template: PANEL_TPL,
   });
